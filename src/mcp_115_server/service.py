@@ -215,7 +215,7 @@ class P115Service:
         directory = self._fs_call("get_attr", target, refresh=refresh)
         if not directory["is_dir"]:
             raise ToolError("Target is not a directory.")
-        entries = self._fs_call("readdir", target, refresh=refresh)
+        entries = self._list_directory_entries(int(directory["id"]))
         return {
             "directory": self._normalize(directory),
             "entries": [self._normalize(entry) for entry in entries],
@@ -1185,6 +1185,25 @@ class P115Service:
             return self._call_backend(check_response, self._call_backend(client.offline_list_open, page))
         except Exception:
             return self._call_backend(check_response, self._call_backend(client.offline_list, {"page": page, "page_size": 1150}, type="ssp"))
+
+    def _list_directory_entries(self, directory_id: int) -> list[dict[str, Any]]:
+        payload = {"cid": directory_id, "limit": 7000, "offset": 0, "show_dir": 1}
+
+        response = self._with_client_fallback(
+            "list_directory_entries",
+            lambda client, platform: self._call_backend(
+                check_response,
+                self._call_backend(
+                    client.fs_files if self._is_web_like_platform(platform) else client.fs_files_app,
+                    payload,
+                    **({} if self._is_web_like_platform(platform) else {"app": platform or "android"}),
+                ),
+            ),
+        )
+        data = response.get("data", [])
+        if isinstance(data, list):
+            return data
+        return []
 
     @classmethod
     def _should_retry_platform(cls, exc: Exception) -> bool:

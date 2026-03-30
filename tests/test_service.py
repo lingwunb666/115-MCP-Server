@@ -40,6 +40,8 @@ class FakeClient:
         self.share_download_url_payload: tuple[dict, str, bool, str] | None = None
         self.fs_mkdir_payload: tuple[dict, int | str] | None = None
         self.fs_mkdir_app_payload: tuple[dict, int | str, str] | None = None
+        self.fs_files_payload: dict | None = None
+        self.fs_files_app_payload: tuple[dict, str] | None = None
         self.fail_offline_open: bool = False
         self.fail_fs_mkdir_web: bool = False
 
@@ -70,6 +72,14 @@ class FakeClient:
     def fs_mkdir_app(self, payload: dict, pid: int | str = 0, app: str = "android") -> dict:
         self.fs_mkdir_app_payload = (payload, pid, app)
         return {"state": True, "cid": 3, "cname": payload.get("cname", ""), "pid": pid, "app": app}
+
+    def fs_files(self, payload: dict) -> dict:
+        self.fs_files_payload = payload
+        return {"state": True, "data": [{"id": 1, "name": "a", "is_dir": False}, {"id": 2, "name": "b", "is_dir": True}]}
+
+    def fs_files_app(self, payload: dict, app: str = "android") -> dict:
+        self.fs_files_app_payload = (payload, app)
+        return {"state": True, "data": [{"id": 1, "name": "a", "is_dir": False}, {"id": 2, "name": "b", "is_dir": True}]}
 
     def fs_move(self, payload: list[int], pid: int = 0) -> dict:
         self.move_payload = (payload, pid)
@@ -319,6 +329,7 @@ class P115ServiceTests(unittest.TestCase):
         result = service.list_directory()
         self.assertEqual(result["directory"]["id"], 0)
         self.assertEqual(result["count"], 2)
+        self.assertEqual(service.client().fs_files_payload["cid"], 0)
 
     def test_search_uses_directory_id_scope(self) -> None:
         service = self.make_service()
