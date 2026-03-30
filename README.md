@@ -193,7 +193,7 @@ scripts\run-http.cmd
 
 在开始之前，先准备这几个信息：
 
-- 推荐命令入口：`C:\Users\flami\Downloads\115-MCP\.venv\Scripts\115-MCP-Server.exe`
+- Python 可执行文件：`C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
 - 备用模块入口：`python -m mcp_115_server`
 - 推荐环境变量：
 
@@ -212,8 +212,8 @@ P115_CONSOLE_QRCODE=false
 {
   "mcpServers": {
     "115-MCP-Server": {
-      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\115-MCP-Server.exe",
-      "args": [],
+      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_115_server"],
       "env": {
         "P115_COOKIES_PATH": "C:\\Users\\your-name\\115-cookies.txt",
         "P115_CHECK_FOR_RELOGIN": "true",
@@ -230,8 +230,8 @@ P115_CONSOLE_QRCODE=false
 如果你使用的是支持 MCP 的 OpenCode 版本，可按下列思路配置一个 `stdio` MCP 服务：
 
 - Name: `115-MCP-Server`
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\115-MCP-Server.exe`
-- Args: 留空
+- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
+- Args: `-m mcp_115_server`
 
 可参考通用 stdio 模板，把同样的环境变量填入客户端的 MCP 配置中。
 
@@ -239,8 +239,8 @@ P115_CONSOLE_QRCODE=false
 
 如果你使用的 Claude Code 版本支持 MCP，添加方式同样是 `stdio`：
 
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\115-MCP-Server.exe`
-- Args: 留空
+- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
+- Args: `-m mcp_115_server`
 
 推荐直接使用上面的“通用 stdio 模板”，并替换 `P115_COOKIES_PATH` 为你的本机路径。
 
@@ -252,8 +252,8 @@ P115_CONSOLE_QRCODE=false
 {
   "mcpServers": {
     "115-MCP-Server": {
-      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\115-MCP-Server.exe",
-      "args": [],
+      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_115_server"],
       "env": {
         "P115_COOKIES_PATH": "C:\\Users\\your-name\\115-cookies.txt",
         "P115_CHECK_FOR_RELOGIN": "true",
@@ -269,8 +269,8 @@ P115_CONSOLE_QRCODE=false
 
 新增一个 `stdio` 类型 MCP 服务：
 
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\115-MCP-Server.exe`
-- Args: 留空
+- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
+- Args: `-m mcp_115_server`
 
 环境变量示例：
 
@@ -287,8 +287,8 @@ P115_CONSOLE_QRCODE=false
 
 核心配置仍然是：
 
-- command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\115-MCP-Server.exe`
-- args: 留空
+- command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
+- args: `-m mcp_115_server`
 
 如果你的 Codex 环境更适合走 HTTP，也可以先启动：
 
@@ -341,8 +341,8 @@ http://127.0.0.1:8000/mcp
 
 可直接套用“通用 stdio 模板”，关键字段如下：
 
-- command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\115-MCP-Server.exe`
-- args: 留空
+- command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
+- args: `-m mcp_115_server`
 
 如果 Kiro 当前环境更适合使用 HTTP，也可以先启动服务：
 
@@ -362,8 +362,8 @@ http://127.0.0.1:8000/mcp
 
 最小配置为：
 
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\115-MCP-Server.exe`
-- Args: 留空
+- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
+- Args: `-m mcp_115_server`
 
 环境变量建议至少包含：
 
@@ -386,8 +386,8 @@ http://127.0.0.1:8000/mcp
 {
   "mcpServers": {
     "115-MCP-Server": {
-      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\115-MCP-Server.exe",
-      "args": [],
+      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_115_server"],
       "env": {
         "P115_COOKIES_PATH": "C:\\Users\\your-name\\115-cookies.txt"
       }
@@ -419,7 +419,7 @@ http://127.0.0.1:8000/mcp
 1. 客户端版本是否真的支持 MCP
 2. 是否选择了 `stdio` 或 HTTP MCP 模式
 3. Python 路径是否正确
-4. 是否使用了 `115-MCP-Server.exe` 或备用模块入口
+4. 是否使用了正确的 `python.exe` 与 `-m mcp_115_server` 入口
 5. cookies 是否已正确配置
 6. HTTP 模式下端口和路径是否为 `127.0.0.1:8000/mcp`
 
