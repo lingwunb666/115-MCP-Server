@@ -969,7 +969,7 @@ class P115Service:
 
     def server_info(self) -> dict[str, Any]:
         return {
-            "name": "mcp-115-server",
+            "name": "115-MCP-Server",
             "description": "FastMCP server for 115 cloud storage using p115client.",
             "auth": self.auth_status(validate_remote=False),
             "targeting_rules": {

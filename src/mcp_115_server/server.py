@@ -21,7 +21,7 @@ Configure authentication with P115_COOKIES or P115_COOKIES_PATH before calling s
 def create_server(service: P115Service | None = None) -> FastMCP:
     bound_service = service or P115Service()
     mcp = FastMCP(
-        name="mcp-115-server",
+        name="115-MCP-Server",
         instructions=SERVER_INSTRUCTIONS,
         version="0.1.0",
         website_url="https://p115client.readthedocs.io/en/latest/",
