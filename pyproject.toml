@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-115-server"
+version = "0.1.0"
+description = "FastMCP server for 115 cloud storage powered by p115client"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+  { name = "OpenAI" }
+]
+dependencies = [
+  "fastmcp>=3.1.1,<4",
+  "p115client>=0.0.8.4.6,<0.1",
+  "pydantic-settings>=2.0,<3",
+  "yarl>=1.23,<2",
+]
+
+[project.scripts]
+mcp-115-server = "mcp_115_server.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
