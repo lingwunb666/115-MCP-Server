@@ -15,6 +15,41 @@ from yarl import URL
 from .config import Settings
 
 
+DEFAULT_PLATFORM_CANDIDATES = (
+    "web",
+    "desktop",
+    "harmony",
+    "apple_tv",
+    "android",
+    "qandroid",
+    "ios",
+    "115ios",
+    "ipad",
+    "115ipad",
+    "wechatmini",
+    "alipaymini",
+    "tv",
+    "windows",
+    "mac",
+    "linux",
+    "os_windows",
+    "os_mac",
+    "os_linux",
+)
+
+WEB_LIKE_PLATFORMS = {
+    "web",
+    "desktop",
+    "harmony",
+    "windows",
+    "mac",
+    "linux",
+    "os_windows",
+    "os_mac",
+    "os_linux",
+}
+
+
 class OfflineClearScope(StrEnum):
     COMPLETED = "completed"
     ALL = "all"
@@ -52,12 +87,18 @@ class P115Service:
         self.settings = settings or Settings()
         self._client_instance: P115Client | None = None
         self._fs_instance: P115FileSystem | None = None
+        self._client_cache: dict[str | None, P115Client] = {}
+        self._fs_cache: dict[str | None, P115FileSystem] = {}
+        self._active_platform: str | None = None
         self._qrcode_sessions: dict[str, dict[str, Any]] = {}
 
     def auth_status(self, validate_remote: bool = False) -> dict[str, Any]:
         status: dict[str, Any] = {
             "configured": self.settings.has_auth_configuration,
             "cookies_source": self.settings.cookies_source,
+            "preferred_platform": self.settings.preferred_platform,
+            "fallback_platforms": self.settings.fallback_platforms,
+            "active_platform": self._active_platform,
             "check_for_relogin": self.settings.p115_check_for_relogin,
             "allow_qrcode_login": self.settings.p115_allow_qrcode_login,
             "console_qrcode": self.settings.p115_console_qrcode,
@@ -69,7 +110,10 @@ class P115Service:
 
         if validate_remote:
             try:
-                status["remote_logged_in"] = bool(self.client().login_status())
+                status["remote_logged_in"] = self._with_client_fallback(
+                    "validate_remote_login",
+                    lambda client, _platform: bool(self._call_backend(client.login_status)),
+                )
             except Exception as exc:  # noqa: BLE001
                 status["remote_logged_in"] = False
                 status["remote_error"] = self._format_backend_error(exc)
@@ -139,8 +183,17 @@ class P115Service:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(cookies, encoding="utf-8")
             saved_to = str(destination)
-        self._client_instance = P115Client(cookies, check_for_relogin=self.settings.p115_check_for_relogin, app=self.settings.p115_app)
-        self._fs_instance = P115FileSystem(self._client_instance)
+        preferred_platform = session["app"] if session["app"] else self.settings.preferred_platform
+        self._client_instance = None
+        self._fs_instance = None
+        self._client_cache.clear()
+        self._fs_cache.clear()
+        self._with_client_fallback(
+            "activate_qrcode_cookies",
+            lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
+            preferred_platform=preferred_platform,
+            cookies_source=cookies,
+        )
         self._qrcode_sessions.pop(session_id, None)
         return {
             "session_id": session_id,
@@ -159,10 +212,10 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=True)
-        directory = self._call_backend(self.fs().get_attr, target, refresh=refresh)
+        directory = self._fs_call("get_attr", target, refresh=refresh)
         if not directory["is_dir"]:
             raise ToolError("Target is not a directory.")
-        entries = self._call_backend(self.fs().readdir, target, refresh=refresh)
+        entries = self._fs_call("readdir", target, refresh=refresh)
         return {
             "directory": self._normalize(directory),
             "entries": [self._normalize(entry) for entry in entries],
@@ -177,7 +230,7 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        return self._normalize(self._call_backend(self.fs().get_attr, target, refresh=refresh))
+        return self._normalize(self._fs_call("get_attr", target, refresh=refresh))
 
     def search_entries(
         self,
@@ -201,23 +254,20 @@ class P115Service:
         cid = 0
         scope: dict[str, Any] | None = None
         if target != "":
-            scope = self._call_backend(self.fs().get_attr, target)
+            scope = self._fs_call("get_attr", target)
             if not scope["is_dir"]:
                 raise ToolError("Search scope must be a directory.")
             cid = int(scope["id"])
 
-        response = self._call_backend(
-            check_response,
-            self._call_backend(
-                self.client().fs_search,
-                {
-                    "cid": cid,
-                    "limit": limit,
-                    "offset": offset,
-                    "search_value": query,
-                    "show_dir": 1,
-                },
-            ),
+        response = self._client_call(
+            "fs_search",
+            {
+                "cid": cid,
+                "limit": limit,
+                "offset": offset,
+                "search_value": query,
+                "show_dir": 1,
+            },
         )
         data = response.get("data", response)
         return {
@@ -238,8 +288,19 @@ class P115Service:
     ) -> dict[str, Any]:
         if not name.strip():
             raise ToolError("name must not be empty.")
-        parent = self._resolve_remote(remote_id=parent_id, remote_path=parent_path, allow_root_default=True)
-        return self._normalize(self._call_backend(self.fs().mkdir, parent, name=name, refresh=refresh))
+        parent_directory_id = self._resolve_directory_id(remote_id=parent_id, remote_path=parent_path, allow_root_default=True)
+        payload = {"cname": name.strip()}
+
+        def attempt(client: P115Client, platform: str | None):
+            if self._is_web_like_platform(platform):
+                return self._call_backend(check_response, self._call_backend(client.fs_mkdir, payload, pid=parent_directory_id))
+            return self._call_backend(
+                check_response,
+                self._call_backend(client.fs_mkdir_app, payload, pid=parent_directory_id, app=platform or "android"),
+            )
+
+        response = self._with_client_fallback("create_directory", attempt)
+        return self._normalize(response)
 
     def resolve_directory(
         self,
@@ -248,23 +309,23 @@ class P115Service:
     ) -> dict[str, Any]:
         if not remote_path.strip():
             raise ToolError("remote_path must not be empty.")
-        response = self._call_backend(check_response, self._call_backend(self.client().fs_dir_getid, remote_path))
+        directory_id = self._resolve_directory_id(remote_path=remote_path, remote_id=None, allow_root_default=False)
         return {
             "remote_path": remote_path,
-            "result": self._normalize(response),
+            "result": {"id": directory_id, "path": remote_path},
         }
 
     def get_storage_info(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().fs_storage_info))
+        response = self._client_call("fs_storage_info")
         return self._normalize(response)
 
     def get_account_info(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().user_info))
+        response = self._client_call("user_info")
         return self._normalize(response)
 
     def get_index_info(self, include_space_numbers: bool = False) -> dict[str, Any]:
         payload = 1 if include_space_numbers else 0
-        response = self._call_backend(check_response, self._call_backend(self.client().fs_index_info, payload))
+        response = self._client_call("fs_index_info", payload)
         return self._normalize(response)
 
     def path_exists(
@@ -275,7 +336,7 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=True)
-        exists = self._call_backend(self.fs().exists, target, refresh=refresh)
+        exists = self._fs_call("exists", target, refresh=refresh)
         return {
             "target": {"remote_id": remote_id, "remote_path": remote_path or ("/" if target == "" else None)},
             "exists": bool(exists),
@@ -289,10 +350,10 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=True)
-        metadata = self._call_backend(self.fs().get_attr, target, refresh=refresh)
+        metadata = self._fs_call("get_attr", target, refresh=refresh)
         if not metadata["is_dir"]:
             raise ToolError("Target is not a directory.")
-        count = self._call_backend(self.fs().dirlen, target, refresh=refresh)
+        count = self._fs_call("dirlen", target, refresh=refresh)
         return {
             "directory": self._normalize(metadata),
             "count": int(count),
@@ -306,7 +367,7 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        ancestors = self._call_backend(self.fs().get_ancestors, target, refresh=refresh)
+        ancestors = self._fs_call("get_ancestors", target, refresh=refresh)
         return {
             "target": self.get_metadata(remote_id=remote_id, remote_path=remote_path, refresh=refresh),
             "ancestors": self._normalize(ancestors),
@@ -327,8 +388,8 @@ class P115Service:
         if limit <= 0:
             raise ToolError("limit must be positive.")
         target = self._resolve_remote(remote_id=directory_id, remote_path=directory_path, allow_root_default=True)
-        entries_iter = self._call_backend(
-            self.fs().glob,
+        entries_iter = self._fs_call(
+            "glob",
             pattern=pattern,
             top=target,
             ignore_case=ignore_case,
@@ -342,7 +403,7 @@ class P115Service:
                     break
         except Exception as exc:  # noqa: BLE001
             raise ToolError(self._format_backend_error(exc)) from exc
-        scope = self._normalize(self._call_backend(self.fs().get_attr, target, refresh=refresh)) if target != "" else {"id": 0, "name": "/", "is_dir": True}
+        scope = self._normalize(self._fs_call("get_attr", target, refresh=refresh)) if target != "" else {"id": 0, "name": "/", "is_dir": True}
         return {
             "pattern": pattern,
             "scope": scope,
@@ -367,11 +428,11 @@ class P115Service:
         if max_depth < 1:
             raise ToolError("max_depth must be at least 1.")
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=True)
-        root_meta = self._call_backend(self.fs().get_attr, target, refresh=refresh)
+        root_meta = self._fs_call("get_attr", target, refresh=refresh)
         if not root_meta["is_dir"]:
             raise ToolError("Target is not a directory.")
-        walk_iter = self._call_backend(
-            self.fs().walk,
+        walk_iter = self._fs_call(
+            "walk",
             target,
             topdown=topdown,
             min_depth=1,
@@ -411,7 +472,7 @@ class P115Service:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
         return {
             "target": self.get_metadata(remote_id=remote_id, remote_path=remote_path, refresh=refresh),
-            "stat": self._normalize(self._call_backend(self.fs().stat, target, refresh=refresh)),
+            "stat": self._normalize(self._fs_call("stat", target, refresh=refresh)),
         }
 
     def offline_add_urls(
@@ -426,10 +487,21 @@ class P115Service:
         payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
         if remote_dir_id is not None:
             payload["wp_path_id"] = remote_dir_id
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_add_urls_open, payload))
+        open_payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
+        legacy_payload: dict[str, Any] = {f"url[{index}]": value for index, value in enumerate(normalized_urls)}
         return {
             "urls": normalized_urls,
-            "result": self._normalize(response),
+            "result": self._normalize(
+                self._with_client_fallback(
+                    "offline_add_urls",
+                    lambda client, platform: self._offline_add_urls_with_platform(
+                        client,
+                        platform,
+                        open_payload=open_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
+                        legacy_payload=legacy_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
+                    ),
+                )
+            ),
         }
 
     def offline_get_torrent_info(self, torrent_sha1: str, pick_code: str) -> dict[str, Any]:
@@ -438,10 +510,7 @@ class P115Service:
         if not pick_code.strip():
             raise ToolError("pick_code must not be empty.")
         payload = {"torrent_sha1": torrent_sha1.strip(), "pick_code": pick_code.strip()}
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().offline_torrent_info_open, payload),
-        )
+        response = self._client_call("offline_torrent_info_open", payload)
         return self._normalize(response)
 
     def offline_add_torrent(
@@ -470,13 +539,16 @@ class P115Service:
             payload["wp_path_id"] = remote_dir_id
         if save_path.strip():
             payload["save_path"] = save_path.strip()
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_add_torrent_open, payload))
+        response = self._client_call("offline_add_torrent_open", payload)
         return self._normalize(response)
 
     def offline_list_tasks(self, page: int = 1) -> dict[str, Any]:
         if page <= 0:
             raise ToolError("page must be positive.")
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_list_open, page))
+        response = self._with_client_fallback(
+            "offline_list_tasks",
+            lambda client, platform: self._offline_list_tasks_with_platform(client, platform, page),
+        )
         data = response.get("data", response)
         return {
             "page": page,
@@ -503,7 +575,13 @@ class P115Service:
                 payload["stat"] = OFFLINE_TASK_STATUS_TO_FLAG[OfflineTaskStatus(status)]
             except ValueError as exc:
                 raise ToolError(f"Invalid offline task status: {status}") from exc
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_list, payload))
+        response = self._with_client_fallback(
+            "offline_list_tasks_advanced",
+            lambda client, platform: self._call_backend(
+                check_response,
+                self._call_backend(client.offline_list, payload, type="web" if self._is_web_like_platform(platform) else "ssp"),
+            ),
+        )
         return {
             "page": page,
             "page_size": page_size,
@@ -518,7 +596,7 @@ class P115Service:
         if not info_hash.strip():
             raise ToolError("info_hash must not be empty.")
         payload = {"info_hash": info_hash.strip(), "del_source_file": int(delete_source_file)}
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_remove_open, payload))
+        response = self._client_call("offline_remove_open", payload)
         return self._normalize(response)
 
     def offline_remove_tasks(self, info_hashes: list[str], delete_source_file: bool = False) -> dict[str, Any]:
@@ -527,7 +605,7 @@ class P115Service:
             raise ToolError("info_hashes must contain at least one non-empty value.")
         payload: dict[str, Any] = {f"hash[{index}]": value for index, value in enumerate(normalized_hashes)}
         payload["flag"] = int(delete_source_file)
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_remove, payload))
+        response = self._client_call("offline_remove", payload)
         return {
             "info_hashes": normalized_hashes,
             "delete_source_file": delete_source_file,
@@ -539,33 +617,30 @@ class P115Service:
             clear_scope = OfflineClearScope(scope)
         except ValueError as exc:
             raise ToolError(f"Invalid scope: {scope}") from exc
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().offline_clear_open, OFFLINE_CLEAR_SCOPE_TO_FLAG[clear_scope]),
-        )
+        response = self._client_call("offline_clear_open", OFFLINE_CLEAR_SCOPE_TO_FLAG[clear_scope])
         return {
             "scope": clear_scope.value,
             "result": self._normalize(response),
         }
 
     def offline_get_quota_info(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_quota_info_open))
+        response = self._client_call("offline_quota_info_open")
         return self._normalize(response)
 
     def offline_get_sign_info(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_sign))
+        response = self._client_call("offline_sign")
         return self._normalize(response)
 
     def offline_get_quota_package_array(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_quota_package_array))
+        response = self._client_call("offline_quota_package_array")
         return self._normalize(response)
 
     def offline_get_quota_package_info(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_quota_package_info))
+        response = self._client_call("offline_quota_package_info")
         return self._normalize(response)
 
     def offline_get_download_paths(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_download_path))
+        response = self._client_call("offline_download_path")
         return self._normalize(response)
 
     def offline_set_download_path(
@@ -575,13 +650,10 @@ class P115Service:
         remote_dir_path: str | None = None,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_dir_id, remote_path=remote_dir_path, allow_root_default=False)
-        metadata = self._call_backend(self.fs().get_attr, target)
+        metadata = self._fs_call("get_attr", target)
         if not metadata["is_dir"]:
             raise ToolError("Offline download path must be a directory.")
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().offline_download_path_set, int(metadata["id"])),
-        )
+        response = self._client_call("offline_download_path_set", int(metadata["id"]))
         return {
             "directory": self._normalize(metadata),
             "result": self._normalize(response),
@@ -590,11 +662,11 @@ class P115Service:
     def offline_restart_task(self, info_hash: str) -> dict[str, Any]:
         if not info_hash.strip():
             raise ToolError("info_hash must not be empty.")
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_restart, info_hash.strip()))
+        response = self._client_call("offline_restart", info_hash.strip())
         return self._normalize(response)
 
     def offline_get_task_count(self, flag: int = 0) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().offline_task_count, int(flag)))
+        response = self._client_call("offline_task_count", int(flag))
         return self._normalize(response)
 
     def list_recycle_bin(self, limit: int = 32, offset: int = 0) -> dict[str, Any]:
@@ -602,20 +674,17 @@ class P115Service:
             raise ToolError("limit must be positive.")
         if offset < 0:
             raise ToolError("offset must be non-negative.")
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().recyclebin_list, {"limit": limit, "offset": offset}),
-        )
+        response = self._client_call("recyclebin_list", {"limit": limit, "offset": offset})
         return self._normalize(response)
 
     def get_recycle_bin_entry(self, rid: int) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().recyclebin_info, rid))
+        response = self._client_call("recyclebin_info", rid)
         return self._normalize(response)
 
     def restore_recycle_bin_entries(self, entry_ids: list[int]) -> dict[str, Any]:
         if not entry_ids:
             raise ToolError("entry_ids must not be empty.")
-        response = self._call_backend(check_response, self._call_backend(self.client().recyclebin_revert, entry_ids))
+        response = self._client_call("recyclebin_revert", entry_ids)
         return {
             "entry_ids": [int(item) for item in entry_ids],
             "result": self._normalize(response),
@@ -627,7 +696,7 @@ class P115Service:
             payload["tid"] = ",".join(str(int(item)) for item in entry_ids)
         if password:
             payload["password"] = password
-        response = self._call_backend(check_response, self._call_backend(self.client().recyclebin_clean, payload))
+        response = self._client_call("recyclebin_clean", payload)
         return {
             "entry_ids": [int(item) for item in entry_ids] if entry_ids else [],
             "result": self._normalize(response),
@@ -653,15 +722,12 @@ class P115Service:
             payload["sort"] = sort.strip()
         if order.strip():
             payload["order"] = order.strip()
-        response = self._call_backend(check_response, self._call_backend(self.client().fs_label_list, payload))
+        response = self._client_call("fs_label_list", payload)
         return self._normalize(response)
 
     def set_entry_labels(self, remote_id: int, label_ids: list[int]) -> dict[str, Any]:
         normalized_label_ids = [int(item) for item in label_ids]
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().fs_label_set, int(remote_id), label=",".join(str(item) for item in normalized_label_ids)),
-        )
+        response = self._client_call("fs_label_set", int(remote_id), label=",".join(str(item) for item in normalized_label_ids))
         return {
             "remote_id": int(remote_id),
             "label_ids": normalized_label_ids,
@@ -674,19 +740,19 @@ class P115Service:
         if offset < 0:
             raise ToolError("offset must be non-negative.")
         payload = {"limit": limit, "offset": offset, "show_cancel_share": int(include_cancelled)}
-        response = self._call_backend(check_response, self._call_backend(self.client().share_list, payload))
+        response = self._client_call("share_list", payload)
         return self._normalize(response)
 
     def get_share_info(self, share_code: str) -> dict[str, Any]:
         if not share_code.strip():
             raise ToolError("share_code must not be empty.")
-        response = self._call_backend(check_response, self._call_backend(self.client().share_info, share_code.strip()))
+        response = self._client_call("share_info", share_code.strip())
         return self._normalize(response)
 
     def get_share_receive_code(self, share_code: str) -> dict[str, Any]:
         if not share_code.strip():
             raise ToolError("share_code must not be empty.")
-        response = self._call_backend(check_response, self._call_backend(self.client().share_recvcode, share_code.strip()))
+        response = self._client_call("share_recvcode", share_code.strip())
         return self._normalize(response)
 
     def receive_share_entries(
@@ -713,11 +779,11 @@ class P115Service:
         }
         if remote_dir_id is not None or remote_dir_path:
             target = self._resolve_remote(remote_id=remote_dir_id, remote_path=remote_dir_path, allow_root_default=False)
-            metadata = self._call_backend(self.fs().get_attr, target)
+            metadata = self._fs_call("get_attr", target)
             if not metadata["is_dir"]:
                 raise ToolError("Share receive destination must be a directory.")
             payload["cid"] = int(metadata["id"])
-        response = self._call_backend(check_response, self._call_backend(self.client().share_receive, payload))
+        response = self._client_call("share_receive", payload)
         return {
             "file_ids": [int(item) for item in file_ids],
             "result": self._normalize(response),
@@ -741,12 +807,16 @@ class P115Service:
         if share_code.strip():
             payload["share_code"] = share_code.strip()
             payload["receive_code"] = receive_code.strip()
-        url = self._call_backend(
-            self.client().share_download_url,
-            payload,
-            url=share_url.strip(),
-            strict=strict,
-            app=app,
+        url = self._with_client_fallback(
+            "share_download_url",
+            lambda client, platform: self._call_backend(
+                client.share_download_url,
+                payload,
+                url=share_url.strip(),
+                strict=strict,
+                app=app or (platform or ""),
+            ),
+            preferred_platform=app or None,
         )
         return {
             "url": self._normalize(url),
@@ -757,14 +827,11 @@ class P115Service:
     def list_share_access_users(self, share_code: str) -> dict[str, Any]:
         if not share_code.strip():
             raise ToolError("share_code must not be empty.")
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().share_access_user_list, share_code.strip()),
-        )
+        response = self._client_call("share_access_user_list", share_code.strip())
         return self._normalize(response)
 
     def get_share_download_quota(self) -> dict[str, Any]:
-        response = self._call_backend(check_response, self._call_backend(self.client().share_notlogin_dl_quota))
+        response = self._client_call("share_notlogin_dl_quota")
         return self._normalize(response)
 
     def upload_local_file(
@@ -786,8 +853,8 @@ class P115Service:
             remote_path=remote_dir_path,
             allow_root_default=True,
         )
-        result = self._call_backend(
-            self.fs().upload,
+        result = self._fs_call(
+            "upload",
             remote_dir,
             file=str(source),
             filename=remote_filename,
@@ -808,11 +875,11 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        self._call_backend(self.fs().get_attr, target, refresh=refresh)
+        self._fs_call("get_attr", target, refresh=refresh)
         destination = Path(local_path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        saved_path, written = self._call_backend(
-            self.fs().download,
+        saved_path, written = self._fs_call(
+            "download",
             target,
             path=str(destination),
             mode="w" if overwrite else "x",
@@ -838,7 +905,7 @@ class P115Service:
             remote_path=destination_dir_path,
             allow_root_default=True,
         )
-        return self._normalize(self._call_backend(self.fs().move, source, to_dir=destination, refresh=refresh))
+        return self._normalize(self._fs_call("move", source, to_dir=destination, refresh=refresh))
 
     def batch_move_entries(
         self,
@@ -854,13 +921,10 @@ class P115Service:
             remote_path=destination_dir_path,
             allow_root_default=True,
         )
-        destination_meta = self._call_backend(self.fs().get_attr, destination)
+        destination_meta = self._fs_call("get_attr", destination)
         if not destination_meta["is_dir"]:
             raise ToolError("Destination must be a directory.")
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().fs_move, source_entry_ids, pid=int(destination_meta["id"])),
-        )
+        response = self._client_call("fs_move", source_entry_ids, pid=int(destination_meta["id"]))
         return {
             "source_ids": source_entry_ids,
             "destination": self._normalize(destination_meta),
@@ -882,7 +946,7 @@ class P115Service:
             remote_path=destination_dir_path,
             allow_root_default=True,
         )
-        return self._normalize(self._call_backend(self.fs().copy, source, to_dir=destination, refresh=refresh))
+        return self._normalize(self._fs_call("copy", source, to_dir=destination, refresh=refresh))
 
     def batch_copy_entries(
         self,
@@ -898,13 +962,10 @@ class P115Service:
             remote_path=destination_dir_path,
             allow_root_default=True,
         )
-        destination_meta = self._call_backend(self.fs().get_attr, destination)
+        destination_meta = self._fs_call("get_attr", destination)
         if not destination_meta["is_dir"]:
             raise ToolError("Destination must be a directory.")
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().fs_copy, source_entry_ids, pid=int(destination_meta["id"])),
-        )
+        response = self._client_call("fs_copy", source_entry_ids, pid=int(destination_meta["id"]))
         return {
             "source_ids": source_entry_ids,
             "destination": self._normalize(destination_meta),
@@ -922,7 +983,7 @@ class P115Service:
         if not new_name.strip():
             raise ToolError("new_name must not be empty.")
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        return self._normalize(self._call_backend(self.fs().rename, target, name=new_name, refresh=refresh))
+        return self._normalize(self._fs_call("rename", target, name=new_name, refresh=refresh))
 
     def remove_entry(
         self,
@@ -932,7 +993,7 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        return self._normalize(self._call_backend(self.fs().remove, target, refresh=refresh))
+        return self._normalize(self._fs_call("remove", target, refresh=refresh))
 
     def batch_remove_entries(
         self,
@@ -941,10 +1002,7 @@ class P115Service:
         source_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         source_entry_ids = self._resolve_many_sources(source_ids=source_ids, source_paths=source_paths)
-        response = self._call_backend(
-            check_response,
-            self._call_backend(self.client().fs_delete, source_entry_ids),
-        )
+        response = self._client_call("fs_delete", source_entry_ids)
         return {
             "source_ids": source_entry_ids,
             "result": self._normalize(response),
@@ -958,10 +1016,10 @@ class P115Service:
         refresh: bool = False,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_id, remote_path=remote_path, allow_root_default=False)
-        metadata = self._call_backend(self.fs().get_attr, target, refresh=refresh)
+        metadata = self._fs_call("get_attr", target, refresh=refresh)
         if metadata["is_dir"]:
             raise ToolError("Download URL is only available for files.")
-        url = self._call_backend(self.fs().get_url, target, refresh=refresh)
+        url = self._fs_call("get_url", target, refresh=refresh)
         return {
             "url": self._normalize(url),
             "target": self._normalize(metadata),
@@ -988,18 +1046,165 @@ class P115Service:
                 raise ToolError(
                     "115 authentication is not configured. Set P115_COOKIES or P115_COOKIES_PATH first."
                 )
-            self._client_instance = P115Client(
-                cookies_source,
-                check_for_relogin=self.settings.p115_check_for_relogin,
-                app=self.settings.p115_app,
-                console_qrcode=self.settings.p115_console_qrcode,
+            self._with_client_fallback(
+                "initialize_client",
+                lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
+                cookies_source=cookies_source,
             )
         return self._client_instance
 
     def fs(self) -> P115FileSystem:
         if self._fs_instance is None:
-            self._fs_instance = P115FileSystem(self.client())
+            self._fs_instance = self._get_fs_for_platform(self._active_platform)
         return self._fs_instance
+
+    def _normalize_platform(self, platform: str | None) -> str | None:
+        if platform is None:
+            return None
+        normalized = platform.strip()
+        return normalized or None
+
+    def _platform_candidates(self, preferred_platform: str | None = None) -> list[str | None]:
+        ordered: list[str | None] = []
+        for platform in (preferred_platform, self.settings.preferred_platform, *self.settings.fallback_platforms, *DEFAULT_PLATFORM_CANDIDATES):
+            normalized = self._normalize_platform(platform)
+            if normalized not in ordered:
+                ordered.append(normalized)
+        return ordered
+
+    def _is_web_like_platform(self, platform: str | None) -> bool:
+        return platform is None or platform in WEB_LIKE_PLATFORMS
+
+    def _cookies_source(self, cookies_source: str | Path | None = None) -> str | Path | None:
+        resolved = cookies_source if cookies_source is not None else self.settings.p115_cookies or self.settings.cookies_path
+        if isinstance(resolved, Path) and not resolved.exists():
+            raise ToolError(f"Configured cookies file does not exist: {resolved}")
+        if resolved is None and not self.settings.p115_allow_qrcode_login:
+            raise ToolError("115 authentication is not configured. Set P115_COOKIES or P115_COOKIES_PATH first.")
+        return resolved
+
+    def _get_client_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115Client:
+        normalized = self._normalize_platform(platform)
+        if normalized not in self._client_cache:
+            self._client_cache[normalized] = P115Client(
+                self._cookies_source(cookies_source),
+                check_for_relogin=self.settings.p115_check_for_relogin,
+                app=normalized,
+                console_qrcode=self.settings.p115_console_qrcode,
+            )
+        return self._client_cache[normalized]
+
+    def _get_fs_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115FileSystem:
+        normalized = self._normalize_platform(platform)
+        if normalized not in self._fs_cache:
+            self._fs_cache[normalized] = P115FileSystem(self._get_client_for_platform(normalized, cookies_source=cookies_source))
+        return self._fs_cache[normalized]
+
+    def _remember_active_platform(self, platform: str | None, client: P115Client | None = None) -> None:
+        normalized = self._normalize_platform(platform)
+        self._active_platform = normalized
+        self._client_instance = client or self._get_client_for_platform(normalized)
+        self._fs_instance = self._get_fs_for_platform(normalized)
+
+    def _with_client_fallback(self, operation: str, callback, *, preferred_platform: str | None = None, cookies_source: str | Path | None = None):
+        errors: list[str] = []
+        for platform in self._platform_candidates(preferred_platform):
+            client = self._get_client_for_platform(platform, cookies_source=cookies_source)
+            try:
+                result = callback(client, platform)
+                self._remember_active_platform(platform, client=client)
+                return result
+            except Exception as exc:  # noqa: BLE001
+                formatted = self._format_backend_error(exc)
+                errors.append(f"{platform or 'default'}: {formatted}")
+                if not self._should_retry_platform(exc):
+                    raise ToolError(formatted) from exc
+        raise ToolError(f"{operation} failed across platforms: {' | '.join(errors)}")
+
+    def _with_fs_fallback(self, operation: str, callback, *, preferred_platform: str | None = None):
+        return self._with_client_fallback(
+            operation,
+            lambda _client, platform: callback(self._get_fs_for_platform(platform), platform),
+            preferred_platform=preferred_platform,
+        )
+
+    def _client_call(self, method_name: str, *args, preferred_platform: str | None = None, check: bool = True, **kwargs):
+        def attempt(client: P115Client, _platform: str | None):
+            response = self._call_backend(getattr(client, method_name), *args, **kwargs)
+            return self._call_backend(check_response, response) if check else response
+
+        return self._with_client_fallback(method_name, attempt, preferred_platform=preferred_platform)
+
+    def _fs_call(self, method_name: str, *args, preferred_platform: str | None = None, **kwargs):
+        return self._with_fs_fallback(
+            method_name,
+            lambda fs, _platform: self._call_backend(getattr(fs, method_name), *args, **kwargs),
+            preferred_platform=preferred_platform,
+        )
+
+    def _resolve_directory_id(self, *, remote_id: int | None, remote_path: str | None, allow_root_default: bool) -> int:
+        if remote_id is not None and remote_path:
+            raise ToolError("Provide either an id or a path, not both.")
+        if remote_id is not None:
+            return int(remote_id)
+        if remote_path:
+            if remote_path == "/":
+                return 0
+
+            def attempt(client: P115Client, platform: str | None):
+                if self._is_web_like_platform(platform):
+                    response = self._call_backend(client.fs_dir_getid, remote_path)
+                else:
+                    response = self._call_backend(client.fs_dir_getid_app, remote_path, app=platform or "android")
+                checked = self._call_backend(check_response, response)
+                return int(checked.get("id") or checked.get("cid") or checked["file_id"])
+
+            return self._with_client_fallback("resolve_directory_id", attempt)
+        if allow_root_default:
+            return 0
+        raise ToolError("A target id or path is required.")
+
+    def _offline_add_urls_with_platform(self, client: P115Client, platform: str | None, *, open_payload: dict[str, Any], legacy_payload: dict[str, Any]):
+        if self._is_web_like_platform(platform):
+            try:
+                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="web"))
+            except Exception:
+                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="ssp"))
+        try:
+            return self._call_backend(check_response, self._call_backend(client.offline_add_urls_open, open_payload))
+        except Exception:
+            try:
+                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="ssp"))
+            except Exception:
+                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="web"))
+
+    def _offline_list_tasks_with_platform(self, client: P115Client, platform: str | None, page: int):
+        if self._is_web_like_platform(platform):
+            return self._call_backend(check_response, self._call_backend(client.offline_list, {"page": page, "page_size": 1150}, type="web"))
+        try:
+            return self._call_backend(check_response, self._call_backend(client.offline_list_open, page))
+        except Exception:
+            return self._call_backend(check_response, self._call_backend(client.offline_list, {"page": page, "page_size": 1150}, type="ssp"))
+
+    @classmethod
+    def _should_retry_platform(cls, exc: Exception) -> bool:
+        message = cls._format_backend_error(exc).lower()
+        retry_markers = (
+            "authorization",
+            "请重新登录",
+            "重新登录",
+            "ip登录异常",
+            "login",
+            "cookie",
+            "sign",
+            "sso",
+            "token",
+            "forbidden",
+            "401",
+            "403",
+            "99",
+        )
+        return any(marker in message for marker in retry_markers)
 
     @staticmethod
     def _normalize(value: Any) -> Any:
@@ -1056,7 +1261,7 @@ class P115Service:
             for path in source_paths:
                 if not path.strip():
                     raise ToolError("source_paths must not contain empty values.")
-                metadata = self._call_backend(self.fs().get_attr, path)
+                metadata = self._fs_call("get_attr", path)
                 resolved_ids.append(int(metadata["id"]))
             return resolved_ids
         raise ToolError("Provide at least one source id or source path.")

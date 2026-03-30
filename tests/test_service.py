@@ -9,7 +9,7 @@ from fastmcp.exceptions import ToolError
 from p115client import P115Client
 
 from mcp_115_server.config import Settings
-from mcp_115_server.service import P115Service
+from mcp_115_server.service import DEFAULT_PLATFORM_CANDIDATES, P115Service
 
 
 class FakeClient:
@@ -23,6 +23,7 @@ class FakeClient:
         self.offline_torrent_payload: dict | None = None
         self.offline_list_payload: int | None = None
         self.offline_list_legacy_payload: dict | None = None
+        self.offline_urls_legacy_payload: dict | None = None
         self.offline_remove_payload: dict | None = None
         self.offline_remove_legacy_payload: dict | None = None
         self.offline_clear_payload: int | None = None
@@ -37,6 +38,10 @@ class FakeClient:
         self.share_recvcode_payload: str | None = None
         self.share_receive_payload: dict | None = None
         self.share_download_url_payload: tuple[dict, str, bool, str] | None = None
+        self.fs_mkdir_payload: tuple[dict, int | str] | None = None
+        self.fs_mkdir_app_payload: tuple[dict, int | str, str] | None = None
+        self.fail_offline_open: bool = False
+        self.fail_fs_mkdir_web: bool = False
 
     def login_status(self) -> bool:
         return True
@@ -51,6 +56,20 @@ class FakeClient:
     def fs_dir_getid(self, payload: str) -> dict:
         self.dir_getid_payload = payload
         return {"state": True, "id": 12, "path": payload}
+
+    def fs_dir_getid_app(self, payload: str, app: str = "android") -> dict:
+        self.dir_getid_payload = payload
+        return {"state": True, "id": 12, "path": payload, "app": app}
+
+    def fs_mkdir(self, payload: dict, pid: int | str = 0) -> dict:
+        if self.fail_fs_mkdir_web:
+            raise RuntimeError("web mkdir failed")
+        self.fs_mkdir_payload = (payload, pid)
+        return {"state": True, "cid": 3, "cname": payload.get("cname", ""), "pid": pid}
+
+    def fs_mkdir_app(self, payload: dict, pid: int | str = 0, app: str = "android") -> dict:
+        self.fs_mkdir_app_payload = (payload, pid, app)
+        return {"state": True, "cid": 3, "cname": payload.get("cname", ""), "pid": pid, "app": app}
 
     def fs_move(self, payload: list[int], pid: int = 0) -> dict:
         self.move_payload = (payload, pid)
@@ -71,6 +90,8 @@ class FakeClient:
         return {"state": True, "data": {"include_space_numbers": payload, "files": 99}}
 
     def offline_add_urls_open(self, payload: dict) -> dict:
+        if self.fail_offline_open:
+            raise RuntimeError("authorization")
         self.offline_urls_payload = payload
         return {"state": True, "data": {"task_ids": [1], "payload": payload}}
 
@@ -85,9 +106,13 @@ class FakeClient:
         self.offline_list_payload = payload
         return {"state": True, "data": {"count": 1, "page_count": 1, "tasks": [{"info_hash": "abc", "status": 1}]}}
 
-    def offline_list(self, payload: dict) -> dict:
+    def offline_list(self, payload: dict, type: str = "web") -> dict:
         self.offline_list_legacy_payload = payload
         return {"state": True, "count": 2, "page_count": 1, "tasks": [{"info_hash": "abc"}, {"info_hash": "def"}]}
+
+    def offline_add_urls(self, payload: dict, method: str = "POST", type: str = "ssp") -> dict:
+        self.offline_urls_legacy_payload = {**payload, "__type__": type}
+        return {"state": True, "data": {"added": True, "payload": payload, "type": type}}
 
     def offline_remove_open(self, payload: dict) -> dict:
         self.offline_remove_payload = payload
@@ -269,8 +294,14 @@ class FakeFS:
 class P115ServiceTests(unittest.TestCase):
     def make_service(self) -> P115Service:
         service = P115Service(Settings())
-        service._client_instance = FakeClient()
-        service._fs_instance = FakeFS()
+        fake_client = FakeClient()
+        fake_fs = FakeFS()
+        service._client_instance = fake_client
+        service._fs_instance = fake_fs
+        for platform in [None, "web", "desktop", "harmony", "android", "apple_tv"]:
+            service._client_cache[platform] = fake_client
+            service._fs_cache[platform] = fake_fs
+        service._active_platform = "web"
         return service
 
     def test_auth_status_reports_missing_configuration(self) -> None:
@@ -331,10 +362,13 @@ class P115ServiceTests(unittest.TestCase):
             def login_status(self) -> bool:
                 raise RuntimeError("remote failed")
 
-        service._client_instance = BrokenClient()
+        broken = BrokenClient()
+        service._client_instance = broken
+        for platform in [None, *DEFAULT_PLATFORM_CANDIDATES]:
+            service._client_cache[platform] = broken
         status = service.auth_status(validate_remote=True)
         self.assertFalse(status["remote_logged_in"])
-        self.assertEqual(status["remote_error"], "remote failed")
+        self.assertIn("remote failed", status["remote_error"])
 
     def test_backend_errors_are_wrapped_as_tool_errors(self) -> None:
         service = self.make_service()
@@ -347,6 +381,25 @@ class P115ServiceTests(unittest.TestCase):
         result = service.resolve_directory(remote_path="/docs")
         self.assertEqual(result["result"]["id"], 12)
         self.assertEqual(service.client().dir_getid_payload, "/docs")
+
+    def test_create_directory_uses_web_mkdir_when_platform_is_web_like(self) -> None:
+        service = self.make_service()
+        result = service.create_directory("demo", parent_id=12)
+        self.assertEqual(service.client().fs_mkdir_payload, ({"cname": "demo"}, 12))
+        self.assertEqual(result["cid"], 3)
+
+    def test_create_directory_falls_back_to_app_mkdir(self) -> None:
+        service = self.make_service()
+        service.client().fail_fs_mkdir_web = False
+
+        def fail_web_mkdir(payload: dict, pid: int | str = 0) -> dict:
+            raise RuntimeError("authorization")
+
+        service.client().fs_mkdir = fail_web_mkdir  # type: ignore[method-assign]
+        result = service.create_directory("demo", parent_id=12)
+        self.assertEqual(service.client().fs_mkdir_app_payload[0], {"cname": "demo"})
+        self.assertEqual(service.client().fs_mkdir_app_payload[1], 12)
+        self.assertEqual(result["cid"], 3)
 
     def test_get_storage_info_returns_normalized_payload(self) -> None:
         service = self.make_service()
@@ -364,6 +417,13 @@ class P115ServiceTests(unittest.TestCase):
         result = service.batch_copy_entries(source_ids=[21, 22], destination_dir_path="/docs")
         self.assertEqual(result["source_ids"], [21, 22])
         self.assertEqual(service.client().copy_payload, ([21, 22], 12))
+
+    def test_move_and_copy_entry_use_fs_fallback_calls(self) -> None:
+        service = self.make_service()
+        moved = service.move_entry(source_path="/docs/demo.txt", destination_dir_path="/docs")
+        copied = service.copy_entry(source_path="/docs/demo.txt", destination_dir_path="/docs")
+        self.assertTrue(moved["moved"])
+        self.assertTrue(copied["copied"])
 
     def test_batch_remove_entries_with_ids(self) -> None:
         service = self.make_service()
@@ -420,8 +480,15 @@ class P115ServiceTests(unittest.TestCase):
     def test_offline_add_urls_creates_payload(self) -> None:
         service = self.make_service()
         result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12)
-        self.assertEqual(service.client().offline_urls_payload["wp_path_id"], 12)
+        self.assertEqual(service.client().offline_urls_legacy_payload["wp_path_id"], 12)
         self.assertEqual(result["urls"][0], "magnet:?xt=urn:btih:test")
+
+    def test_offline_add_urls_falls_back_to_legacy_interface(self) -> None:
+        service = self.make_service()
+        service.client().fail_offline_open = True
+        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12)
+        self.assertEqual(result["result"]["state"], True)
+        self.assertEqual(service.client().offline_urls_legacy_payload["wp_path_id"], 12)
 
     def test_offline_get_torrent_info_returns_data(self) -> None:
         service = self.make_service()
@@ -437,8 +504,8 @@ class P115ServiceTests(unittest.TestCase):
     def test_offline_list_tasks_unwraps_data(self) -> None:
         service = self.make_service()
         result = service.offline_list_tasks(page=2)
-        self.assertEqual(service.client().offline_list_payload, 2)
-        self.assertEqual(result["count"], 1)
+        self.assertEqual(service.client().offline_list_legacy_payload["page"], 2)
+        self.assertEqual(result["count"], 2)
 
     def test_offline_list_tasks_advanced_maps_status(self) -> None:
         service = self.make_service()
@@ -633,6 +700,14 @@ class P115ServiceTests(unittest.TestCase):
                 result = service.finish_qrcode_login("s1", output_path=out)
             self.assertEqual(result["cookies"], "UID=1; CID=2; SEID=3; KID=4")
             self.assertTrue(Path(out).exists())
+
+    def test_finish_qrcode_login_activates_cookies_without_output_path(self) -> None:
+        service = P115Service(Settings(P115_COOKIES="UID=old; CID=old; SEID=old; KID=old"))
+        service._qrcode_sessions["s1"] = {"app": "android", "uid": "u1", "token": {"uid": "u1", "time": 1, "sign": "sig"}, "qrcode_url": "https://qr.example"}
+        with patch.object(P115Client, "login_qrcode_scan_result", return_value={"state": True, "data": {"cookie": "UID=1; CID=2; SEID=3; KID=4"}}):
+            result = service.finish_qrcode_login("s1")
+        self.assertEqual(result["cookies"], "UID=1; CID=2; SEID=3; KID=4")
+        self.assertIsNotNone(service._client_instance)
 
     def test_get_qrcode_login_status_rejects_unknown_session(self) -> None:
         service = P115Service(Settings())
