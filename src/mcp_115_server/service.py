@@ -5,6 +5,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from fastmcp.exceptions import ToolError
@@ -80,6 +81,11 @@ OFFLINE_TASK_STATUS_TO_FLAG = {
     OfflineTaskStatus.COMPLETED: 11,
     OfflineTaskStatus.IN_PROGRESS: 12,
 }
+
+
+class OfflineDuplicatePolicy(StrEnum):
+    ERROR = "error"
+    SKIP = "skip"
 
 
 class P115Service:
@@ -480,17 +486,45 @@ class P115Service:
         urls: list[str],
         *,
         remote_dir_id: int | None = None,
+        duplicate_policy: str = OfflineDuplicatePolicy.ERROR.value,
     ) -> dict[str, Any]:
         normalized_urls = [item.strip() for item in urls if item.strip()]
         if not normalized_urls:
             raise ToolError("urls must contain at least one non-empty entry.")
+        try:
+            duplicate_mode = OfflineDuplicatePolicy(duplicate_policy)
+        except ValueError as exc:
+            raise ToolError(f"Invalid duplicate_policy: {duplicate_policy}") from exc
+        existing_tasks = self._list_all_offline_tasks()
+        duplicates: list[dict[str, Any]] = []
+        unique_urls: list[str] = []
+        for url in normalized_urls:
+            duplicate = self._find_duplicate_offline_task(url, existing_tasks)
+            if duplicate is not None:
+                duplicates.append({"url": url, "task": self._normalize(duplicate)})
+            else:
+                unique_urls.append(url)
+        if duplicates and duplicate_mode is OfflineDuplicatePolicy.ERROR:
+            duplicate_hashes = [str(item["task"].get("info_hash", "")) for item in duplicates]
+            raise ToolError(f"Duplicate offline task detected for info_hash: {', '.join(hash_ for hash_ in duplicate_hashes if hash_)}")
+        if not unique_urls:
+            return {
+                "urls": normalized_urls,
+                "accepted_urls": [],
+                "duplicates": duplicates,
+                "duplicate_policy": duplicate_mode.value,
+                "result": {"state": True, "duplicate": True, "count": len(duplicates)},
+            }
         payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
         if remote_dir_id is not None:
             payload["wp_path_id"] = remote_dir_id
-        open_payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
-        legacy_payload: dict[str, Any] = {f"url[{index}]": value for index, value in enumerate(normalized_urls)}
+        open_payload: dict[str, Any] = {"urls": "\n".join(unique_urls)}
+        legacy_payload: dict[str, Any] = {f"url[{index}]": value for index, value in enumerate(unique_urls)}
         return {
             "urls": normalized_urls,
+            "accepted_urls": unique_urls,
+            "duplicates": duplicates,
+            "duplicate_policy": duplicate_mode.value,
             "result": self._normalize(
                 self._with_client_fallback(
                     "offline_add_urls",
@@ -595,21 +629,39 @@ class P115Service:
     def offline_remove_task(self, info_hash: str, delete_source_file: bool = False) -> dict[str, Any]:
         if not info_hash.strip():
             raise ToolError("info_hash must not be empty.")
-        payload = {"info_hash": info_hash.strip(), "del_source_file": int(delete_source_file)}
-        response = self._client_call("offline_remove_open", payload)
-        return self._normalize(response)
+        normalized_hash = info_hash.strip()
+        response = self._with_client_fallback(
+            "offline_remove_task",
+            lambda client, platform: self._offline_remove_task_with_platform(client, platform, normalized_hash, delete_source_file),
+        )
+        remaining = self._find_offline_task_by_info_hash(normalized_hash)
+        return {
+            "info_hash": normalized_hash,
+            "delete_source_file": delete_source_file,
+            "removed": remaining is None,
+            "result": self._normalize(response),
+        }
 
     def offline_remove_tasks(self, info_hashes: list[str], delete_source_file: bool = False) -> dict[str, Any]:
         normalized_hashes = [item.strip() for item in info_hashes if item.strip()]
         if not normalized_hashes:
             raise ToolError("info_hashes must contain at least one non-empty value.")
-        payload: dict[str, Any] = {f"hash[{index}]": value for index, value in enumerate(normalized_hashes)}
-        payload["flag"] = int(delete_source_file)
-        response = self._client_call("offline_remove", payload)
+        removed: list[str] = []
+        remaining: list[str] = []
+        responses: list[Any] = []
+        for info_hash in normalized_hashes:
+            result = self.offline_remove_task(info_hash, delete_source_file=delete_source_file)
+            responses.append(result["result"])
+            if result["removed"]:
+                removed.append(info_hash)
+            else:
+                remaining.append(info_hash)
         return {
             "info_hashes": normalized_hashes,
             "delete_source_file": delete_source_file,
-            "result": self._normalize(response),
+            "removed": removed,
+            "remaining": remaining,
+            "result": self._normalize(responses),
         }
 
     def offline_clear_tasks(self, scope: str = OfflineClearScope.COMPLETED.value) -> dict[str, Any]:
@@ -1185,6 +1237,62 @@ class P115Service:
             return self._call_backend(check_response, self._call_backend(client.offline_list_open, page))
         except Exception:
             return self._call_backend(check_response, self._call_backend(client.offline_list, {"page": page, "page_size": 1150}, type="ssp"))
+
+    def _offline_remove_task_with_platform(self, client: P115Client, platform: str | None, info_hash: str, delete_source_file: bool):
+        payload_open = {"info_hash": info_hash, "del_source_file": int(delete_source_file)}
+        payload_legacy = {"hash[0]": info_hash, "flag": int(delete_source_file)}
+        if self._is_web_like_platform(platform):
+            try:
+                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
+            except Exception:
+                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
+        try:
+            return self._call_backend(check_response, self._call_backend(client.offline_remove_open, payload_open))
+        except Exception:
+            try:
+                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
+            except Exception:
+                return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
+
+    def _list_all_offline_tasks(self) -> list[dict[str, Any]]:
+        first_page = self.offline_list_tasks(page=1)
+        tasks = list(first_page.get("tasks", []))
+        page_count = int(first_page.get("page_count") or 1)
+        for page in range(2, page_count + 1):
+            page_result = self.offline_list_tasks(page=page)
+            tasks.extend(page_result.get("tasks", []))
+        return tasks
+
+    def _extract_info_hash_from_url(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() == "magnet":
+            query = parse_qs(parsed.query)
+            for xt in query.get("xt", []):
+                lower = xt.lower()
+                marker = "urn:btih:"
+                if marker in lower:
+                    return xt[lower.index(marker) + len(marker):].lower()
+        return None
+
+    def _find_offline_task_by_info_hash(self, info_hash: str) -> dict[str, Any] | None:
+        normalized = info_hash.strip().lower()
+        if not normalized:
+            return None
+        for task in self._list_all_offline_tasks():
+            task_hash = str(task.get("info_hash", "")).strip().lower()
+            if task_hash == normalized:
+                return task
+        return None
+
+    def _find_duplicate_offline_task(self, url: str, tasks: list[dict[str, Any]]) -> dict[str, Any] | None:
+        info_hash = self._extract_info_hash_from_url(url)
+        if not info_hash:
+            return None
+        for task in tasks:
+            task_hash = str(task.get("info_hash", "")).strip().lower()
+            if task_hash == info_hash:
+                return task
+        return None
 
     def _list_directory_entries(self, directory_id: int) -> list[dict[str, Any]]:
         payload = {"cid": directory_id, "limit": 7000, "offset": 0, "show_dir": 1}

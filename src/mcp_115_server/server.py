@@ -197,9 +197,13 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         return bound_service.get_stat(remote_id=remote_id, remote_path=remote_path, refresh=refresh)
 
     @mcp.tool
-    def offline_add_urls(urls: list[str], remote_dir_id: int | None = None) -> dict:
+    def offline_add_urls(
+        urls: list[str],
+        remote_dir_id: int | None = None,
+        duplicate_policy: str = "error",
+    ) -> dict:
         """Create one or more offline download tasks from URLs, magnets, FTP, or ed2k links."""
-        return bound_service.offline_add_urls(urls, remote_dir_id=remote_dir_id)
+        return bound_service.offline_add_urls(urls, remote_dir_id=remote_dir_id, duplicate_policy=duplicate_policy)
 
     @mcp.tool
     def offline_get_torrent_info(torrent_sha1: str, pick_code: str) -> dict:

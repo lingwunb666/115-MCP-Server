@@ -26,6 +26,7 @@ class FakeClient:
         self.offline_urls_legacy_payload: dict | None = None
         self.offline_remove_payload: dict | None = None
         self.offline_remove_legacy_payload: dict | None = None
+        self.fail_offline_remove_open: bool = False
         self.offline_clear_payload: int | None = None
         self.offline_download_path_set_payload: int | None = None
         self.offline_restart_payload: str | None = None
@@ -44,6 +45,7 @@ class FakeClient:
         self.fs_files_app_payload: tuple[dict, str] | None = None
         self.fail_offline_open: bool = False
         self.fail_fs_mkdir_web: bool = False
+        self.offline_tasks = [{"info_hash": "abc", "status": 1}, {"info_hash": "def", "status": 1}]
 
     def login_status(self) -> bool:
         return True
@@ -114,22 +116,28 @@ class FakeClient:
 
     def offline_list_open(self, payload: int = 1) -> dict:
         self.offline_list_payload = payload
-        return {"state": True, "data": {"count": 1, "page_count": 1, "tasks": [{"info_hash": "abc", "status": 1}]}}
+        return {"state": True, "data": {"count": len(self.offline_tasks), "page_count": 1, "tasks": list(self.offline_tasks)}}
 
     def offline_list(self, payload: dict, type: str = "web") -> dict:
         self.offline_list_legacy_payload = payload
-        return {"state": True, "count": 2, "page_count": 1, "tasks": [{"info_hash": "abc"}, {"info_hash": "def"}]}
+        return {"state": True, "count": len(self.offline_tasks), "page_count": 1, "tasks": list(self.offline_tasks)}
 
     def offline_add_urls(self, payload: dict, method: str = "POST", type: str = "ssp") -> dict:
         self.offline_urls_legacy_payload = {**payload, "__type__": type}
         return {"state": True, "data": {"added": True, "payload": payload, "type": type}}
 
     def offline_remove_open(self, payload: dict) -> dict:
+        if self.fail_offline_remove_open:
+            raise RuntimeError("authorization")
         self.offline_remove_payload = payload
+        info_hash = payload.get("info_hash", "")
+        self.offline_tasks = [task for task in self.offline_tasks if task.get("info_hash") != info_hash]
         return {"state": True, "data": {"removed": True}}
 
-    def offline_remove(self, payload: dict) -> dict:
+    def offline_remove(self, payload: dict, method: str = "POST", type: str = "web") -> dict:
         self.offline_remove_legacy_payload = payload
+        hashes = [value for key, value in payload.items() if key.startswith("hash[")]
+        self.offline_tasks = [task for task in self.offline_tasks if task.get("info_hash") not in hashes]
         return {"state": True, "data": {"removed": True, "count": 2}}
 
     def offline_clear_open(self, payload: int = 0) -> dict:
@@ -490,16 +498,30 @@ class P115ServiceTests(unittest.TestCase):
 
     def test_offline_add_urls_creates_payload(self) -> None:
         service = self.make_service()
-        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12)
+        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="skip")
         self.assertEqual(service.client().offline_urls_legacy_payload["wp_path_id"], 12)
+        self.assertEqual(result["accepted_urls"], ["magnet:?xt=urn:btih:test"])
         self.assertEqual(result["urls"][0], "magnet:?xt=urn:btih:test")
 
     def test_offline_add_urls_falls_back_to_legacy_interface(self) -> None:
         service = self.make_service()
         service.client().fail_offline_open = True
-        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12)
+        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="skip")
         self.assertEqual(result["result"]["state"], True)
         self.assertEqual(service.client().offline_urls_legacy_payload["wp_path_id"], 12)
+
+    def test_offline_add_urls_skips_duplicate_info_hash_when_requested(self) -> None:
+        service = self.make_service()
+        service.client().offline_list = lambda payload, type="web": {"state": True, "count": 1, "page_count": 1, "tasks": [{"info_hash": "test", "name": "existing"}]}  # type: ignore[method-assign]
+        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="skip")
+        self.assertEqual(result["accepted_urls"], [])
+        self.assertEqual(len(result["duplicates"]), 1)
+
+    def test_offline_add_urls_raises_for_duplicate_when_policy_is_error(self) -> None:
+        service = self.make_service()
+        service.client().offline_list = lambda payload, type="web": {"state": True, "count": 1, "page_count": 1, "tasks": [{"info_hash": "test", "name": "existing"}]}  # type: ignore[method-assign]
+        with self.assertRaises(ToolError):
+            service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="error")
 
     def test_offline_get_torrent_info_returns_data(self) -> None:
         service = self.make_service()
@@ -526,15 +548,23 @@ class P115ServiceTests(unittest.TestCase):
 
     def test_offline_remove_task_forwards_delete_flag(self) -> None:
         service = self.make_service()
-        service.offline_remove_task("abc", delete_source_file=True)
-        self.assertEqual(service.client().offline_remove_payload["del_source_file"], 1)
+        result = service.offline_remove_task("abc", delete_source_file=True)
+        self.assertTrue(result["removed"])
+        self.assertEqual(service.client().offline_remove_legacy_payload["flag"], 1)
 
     def test_offline_remove_tasks_builds_legacy_payload(self) -> None:
         service = self.make_service()
         result = service.offline_remove_tasks(["abc", "def"], delete_source_file=True)
-        self.assertEqual(service.client().offline_remove_legacy_payload["hash[0]"], "abc")
-        self.assertEqual(service.client().offline_remove_legacy_payload["flag"], 1)
+        self.assertEqual(result["removed"], ["abc", "def"])
+        self.assertEqual(result["remaining"], [])
         self.assertEqual(result["info_hashes"], ["abc", "def"])
+
+    def test_offline_remove_task_falls_back_when_open_delete_fails(self) -> None:
+        service = self.make_service()
+        service._active_platform = "android"
+        service.client().fail_offline_remove_open = True
+        result = service.offline_remove_task("abc")
+        self.assertTrue(result["removed"])
 
     def test_offline_clear_tasks_maps_scope(self) -> None:
         service = self.make_service()
