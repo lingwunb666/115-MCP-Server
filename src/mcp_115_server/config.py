@@ -6,12 +6,8 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PROJECT_ENV_FILE = PROJECT_ROOT / ".env"
-
-
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=PROJECT_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
     p115_cookies: str | None = Field(default=None, alias="P115_COOKIES")
     p115_cookies_path: str | None = Field(default=None, alias="P115_COOKIES_PATH")
