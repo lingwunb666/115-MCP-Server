@@ -100,11 +100,13 @@ python -m venv .venv
 
 本项目支持三种认证方式：
 
-1. 直接传入 `P115_COOKIES`
-2. 通过 `P115_COOKIES_PATH` 读取 cookies 文件
+1. 直接传入环境变量 `P115_COOKIES`
+2. 通过环境变量 `P115_COOKIES_PATH` 指向 cookies 文件
 3. 通过 MCP 工具执行二维码登录
 
-推荐使用 cookies 文件：
+> 本项目**不再支持**通过项目根目录 `.env` 文件自动加载配置，以避免和客户端自身的 MCP 环境配置混淆。
+
+推荐使用环境变量 + cookies 文件：
 
 ```env
 P115_COOKIES_PATH=~/115-cookies.txt
@@ -115,7 +117,7 @@ P115_COOKIE_PLATFORM=web
 P115_PLATFORM_FALLBACKS=desktop,harmony,apple_tv,android,qandroid,ios,115ios,ipad,115ipad,wechatmini,alipaymini,tv,windows,mac,linux,os_windows,os_mac,os_linux
 ```
 
-也支持直接传入 cookies：
+也支持直接通过环境变量传入 cookies：
 
 ```env
 P115_COOKIES=UID=...; CID=...; SEID=...; KID=...
@@ -154,7 +156,7 @@ P115_PLATFORM_FALLBACKS=desktop,harmony,apple_tv,android,qandroid,ios,115ios,ipa
 - `web/desktop/harmony/windows/mac/linux/os_*` 更偏网页/桌面路径。
 - `android/qandroid/ios/115ios/ipad/115ipad/wechatmini/alipaymini/tv/apple_tv` 更偏 app/移动端路径。
 
-### 推荐的 `.env` 写法
+### 推荐的环境变量写法
 
 ```env
 P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
@@ -166,7 +168,11 @@ P115_CONSOLE_QRCODE=false
 FASTMCP_TRANSPORT=stdio
 ```
 
-如果你把 `.env` 放在项目根目录，服务启动时会自动读取。
+这些变量应通过以下任一方式提供：
+
+- MCP 客户端配置中的 `environment`
+- 当前终端 / 系统环境变量
+- 进程启动器（如 OpenCode、Claude Desktop、Cursor 等）的环境注入
 
 ## 启动
 
@@ -256,180 +262,18 @@ P115_CONSOLE_QRCODE=false
 }
 ```
 
-### OpenCode
+大多数支持 MCP 的客户端，本质上都只需要以下两种接入方式之一：
 
-如果你使用的是支持 MCP 的 OpenCode 版本，可按下列思路配置一个 `stdio` MCP 服务：
+- `stdio`
+- `http`
 
-- Name: `115-MCP-Server`
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
-- Args: `-m mcp_115_server`
-
-可参考通用 stdio 模板，把同样的环境变量填入客户端的 MCP 配置中。
-
-### Claude Code
-
-如果你使用的 Claude Code 版本支持 MCP，添加方式同样是 `stdio`：
-
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
-- Args: `-m mcp_115_server`
-
-推荐直接使用上面的“通用 stdio 模板”，并替换 `P115_COOKIES_PATH` 为你的本机路径。
-
-### Claude Desktop
-
-将以下内容合并到 Claude Desktop 的 MCP 配置中：
-
-```json
-{
-  "mcpServers": {
-    "115-MCP-Server": {
-      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "mcp_115_server"],
-      "env": {
-        "P115_COOKIES_PATH": "C:\\Users\\your-name\\115-cookies.txt",
-        "P115_CHECK_FOR_RELOGIN": "true",
-        "P115_ALLOW_QRCODE_LOGIN": "false",
-        "P115_CONSOLE_QRCODE": "false"
-      }
-    }
-  }
-}
-```
-
-### Cherry Studio
-
-新增一个 `stdio` 类型 MCP 服务：
-
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
-- Args: `-m mcp_115_server`
-
-环境变量示例：
-
-```text
-P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
-P115_CHECK_FOR_RELOGIN=true
-P115_ALLOW_QRCODE_LOGIN=false
-P115_CONSOLE_QRCODE=false
-```
-
-### Codex
-
-如果你使用支持 MCP 的 Codex 客户端或运行环境，可按“通用 stdio 模板”接入。
-
-核心配置仍然是：
-
-- command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
-- args: `-m mcp_115_server`
-
-如果你的 Codex 环境更适合走 HTTP，也可以先启动：
-
-```bash
-./.venv/Scripts/115-MCP-Server --transport http --host 127.0.0.1 --port 8000 --path /mcp
-```
-
-然后在客户端里填入：
-
-```text
-http://127.0.0.1:8000/mcp
-```
-
-### GitHub Copilot
-
-如果你当前使用的是支持 MCP 的 Copilot 宿主环境，也建议按“通用 stdio 模板”配置。
-
-接入时请确认：
-
-1. Copilot 当前版本支持 MCP
-2. MCP 类型选择为 `stdio` 或等价模式
-3. Python 路径与 `args` 正确
-4. 环境变量中提供了可用的 cookies 配置
-
-### Gemini
-
-如果你使用支持 MCP 的 Gemini 客户端或中间层，也可以使用两种方式接入：
-
-#### 方式一：stdio
-
-直接套用“通用 stdio 模板”。
-
-#### 方式二：HTTP
-
-先启动服务：
-
-```bash
-./.venv/Scripts/115-MCP-Server --transport http --host 127.0.0.1 --port 8000 --path /mcp
-```
-
-再在 Gemini 对应的 MCP 配置中填入：
-
-```text
-http://127.0.0.1:8000/mcp
-```
-
-### Kiro
-
-如果你使用支持 MCP 的 Kiro 版本，推荐优先使用 `stdio` 方式接入。
-
-可直接套用“通用 stdio 模板”，关键字段如下：
-
-- command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
-- args: `-m mcp_115_server`
-
-如果 Kiro 当前环境更适合使用 HTTP，也可以先启动服务：
-
-```bash
-./.venv/Scripts/115-MCP-Server --transport http --host 127.0.0.1 --port 8000 --path /mcp
-```
-
-然后在客户端中配置：
-
-```text
-http://127.0.0.1:8000/mcp
-```
-
-### Antigravity
-
-如果你使用的是支持 MCP 的 Antigravity 环境，接入方式同样建议优先使用 `stdio`。
-
-最小配置为：
-
-- Command: `C:\Users\flami\Downloads\115-MCP\.venv\Scripts\python.exe`
-- Args: `-m mcp_115_server`
-
-环境变量建议至少包含：
-
-```text
-P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
-P115_CHECK_FOR_RELOGIN=true
-```
-
-如果 Antigravity 支持 HTTP MCP，也可以直接连接：
-
-```text
-http://127.0.0.1:8000/mcp
-```
-
-### Cursor
-
-如果你的 Cursor 版本支持 MCP，可在对应的 MCP 配置文件中加入：
-
-```json
-{
-  "mcpServers": {
-    "115-MCP-Server": {
-      "command": "C:\\Users\\flami\\Downloads\\115-MCP\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "mcp_115_server"],
-      "env": {
-        "P115_COOKIES_PATH": "C:\\Users\\your-name\\115-cookies.txt"
-      }
-    }
-  }
-}
-```
+无论你使用的是 OpenCode、Claude Code、Claude Desktop、Cursor、Gemini、Kiro、Antigravity、Cherry Studio，还是其它支持 MCP 的客户端，都建议优先按下面的通用模板配置。
 
 ### HTTP 模式接入
 
-先启动：
+如果客户端支持通过 URL 连接 MCP，可使用 HTTP 模式。
+
+先启动服务：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run-http.ps1
@@ -441,7 +285,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run-http.ps1
 http://127.0.0.1:8000/mcp
 ```
 
-如果某个客户端支持基于 HTTP 的 MCP 连接，直接填这个地址即可。
+然后在客户端中填入这个地址即可。
 
 ### 接入排查建议
 
@@ -458,7 +302,7 @@ http://127.0.0.1:8000/mcp
 
 ### 常见使用流程 1：已有 cookies，直接使用
 
-1. 配置 `.env`
+1. 配置环境变量
 2. 启动服务
 3. 在客户端中调用：
    - `auth_status`
