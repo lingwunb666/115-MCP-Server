@@ -681,6 +681,7 @@ scripts/
 已实现的离线下载工具：
 
 - `offline_add_urls(urls=[...], remote_dir_id=123)`
+- `offline_add_urls(urls=[...], remote_dir_id=123, duplicate_policy="error")`
 - `offline_get_torrent_info(torrent_sha1="...", pick_code="...")`
 - `offline_add_torrent(torrent_sha1="...", pick_code="...", wanted_indexes=[0,1])`
 - `offline_list_tasks(page=1)`
@@ -709,6 +710,10 @@ scripts/
 说明：
 
 - `offline_add_urls` 适合 HTTP / HTTPS / FTP / magnet / ed2k
+- `offline_add_urls` 支持 `duplicate_policy`：
+  - `error`：如果检测到相同磁链 / 相同 `info_hash` 的云下载任务已存在，立即返回明确错误
+  - `skip`：跳过重复任务，只提交新的 URL
+- 默认推荐使用 `duplicate_policy="error"`，这样可以避免重复磁链导致的卡住或误判
 - `offline_get_torrent_info` 可先查看 BT 内容，再配合 `wanted_indexes` 精选文件
 - `offline_list_tasks` 已经对 Open API 的响应结构做了整形，直接返回 `count / page_count / tasks`
 - `offline_set_download_path` 可以用 `remote_dir_id` 或 `remote_dir_path` 指定默认离线目录
@@ -777,6 +782,49 @@ scripts/
 - `remote_path`: 115 路径，例如 `/文档/项目`
 
 两者只能传一个；目录类工具若都不传，则默认根目录。
+
+### 远程 ID 传参规则（重要）
+
+所有远程 ID 都建议并推荐按**字符串**传入，不要按 JSON number / 数值传入。
+
+正确示例：
+
+```json
+{
+  "remote_id": "3398357158620823140"
+}
+```
+
+不推荐示例：
+
+```json
+{
+  "remote_id": 3398357158620823140
+}
+```
+
+原因：
+
+- 115 的很多远程 ID 很长
+- 在某些客户端、语言运行时、JSON 处理中，超长整数可能发生精度丢失
+- 一旦被改写，例如尾数被截断或归整，就会导致操作到错误的文件或目录
+
+因此：
+
+- `remote_id`
+- `parent_id`
+- `directory_id`
+- `remote_dir_id`
+- `source_id`
+- `destination_dir_id`
+- `file_id`
+- `rid`
+- `source_ids`
+- `entry_ids`
+- `file_ids`
+- `label_ids`
+
+都应优先按字符串或字符串数组传入。
 
 ## 测试
 
