@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -311,7 +312,7 @@ class FakeFS:
 
 class P115ServiceTests(unittest.TestCase):
     def make_service(self) -> P115Service:
-        service = P115Service(Settings())
+        service = P115Service(Settings(P115_COOKIES="UID=dummy; CID=dummy; SEID=dummy; KID=dummy"))
         fake_client = FakeClient()
         fake_fs = FakeFS()
         service._client_instance = fake_client
@@ -320,7 +321,27 @@ class P115ServiceTests(unittest.TestCase):
             service._client_cache[platform] = fake_client
             service._fs_cache[platform] = fake_fs
         service._active_platform = "web"
+        service._cookie_source_signature = ("inline", "UID=dummy; CID=dummy; SEID=dummy; KID=dummy")
         return service
+
+    def test_cookie_file_change_rebuilds_cached_client(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cookie_file = Path(temp_dir) / "115-cookies.txt"
+            cookie_file.write_text("UID=old; CID=old; SEID=old; KID=old", encoding="utf-8")
+            class CapturingClient:
+                def __init__(self, cookies=None, check_for_relogin=False, app=None, console_qrcode=True):
+                    self.cookies = cookies
+                    self.app = app
+
+            with patch.dict(os.environ, {"P115_COOKIES": "", "P115_COOKIES_PATH": ""}, clear=False), patch("mcp_115_server.service.P115Client", CapturingClient):
+                service = P115Service(Settings(P115_COOKIES_PATH=str(cookie_file), P115_COOKIES=None))
+                first = service._get_client_for_platform("web")
+                cookie_file.write_text("UID=new; CID=new; SEID=new; KID=new", encoding="utf-8")
+                second = service._get_client_for_platform("web")
+
+            self.assertIsNot(first, second)
+            self.assertEqual(str(first.cookies), str(cookie_file))
+            self.assertEqual(str(second.cookies), str(cookie_file))
 
     def test_auth_status_reports_missing_configuration(self) -> None:
         service = P115Service(Settings())
@@ -332,17 +353,29 @@ class P115ServiceTests(unittest.TestCase):
         with self.assertRaises(ToolError):
             P115Service._resolve_remote(remote_id=1, remote_path="/docs", allow_root_default=False)
 
+    def test_parse_remote_id_accepts_long_decimal_string(self) -> None:
+        parsed = P115Service._parse_remote_id("3398357158620823140", "remote_id")
+        self.assertEqual(parsed, 3398357158620823140)
+
+    def test_parse_remote_id_rejects_unsafe_long_number(self) -> None:
+        with self.assertRaises(ToolError):
+            P115Service._parse_remote_id(3398357158620823140, "remote_id")
+
+    def test_parse_remote_id_rejects_non_decimal_string(self) -> None:
+        with self.assertRaises(ToolError):
+            P115Service._parse_remote_id("3398abc", "remote_id")
+
     def test_list_directory_defaults_to_root(self) -> None:
         service = self.make_service()
         result = service.list_directory()
-        self.assertEqual(result["directory"]["id"], 0)
+        self.assertEqual(result["directory"]["id"], "0")
         self.assertEqual(result["count"], 2)
         self.assertEqual(service.client().fs_files_payload["cid"], 0)
 
     def test_search_uses_directory_id_scope(self) -> None:
         service = self.make_service()
         result = service.search_entries("demo", directory_path="/docs", limit=10, offset=0)
-        self.assertEqual(result["scope"]["id"], 12)
+        self.assertEqual(result["scope"]["id"], "12")
         self.assertEqual(service.client().search_payload["cid"], 12)
 
     def test_upload_validates_local_file(self) -> None:
@@ -367,6 +400,7 @@ class P115ServiceTests(unittest.TestCase):
         result = service.get_download_url(remote_path="/docs/demo.txt")
         self.assertEqual(result["url"], "https://example.com/file")
         self.assertEqual(result["target"]["name"], "demo.txt")
+        self.assertEqual(result["target"]["id"], "21")
 
     def test_missing_cookies_file_fails_fast(self) -> None:
         settings = Settings(P115_COOKIES_PATH="C:/definitely-missing/115-cookies.txt")
@@ -405,7 +439,7 @@ class P115ServiceTests(unittest.TestCase):
         service = self.make_service()
         result = service.create_directory("demo", parent_id=12)
         self.assertEqual(service.client().fs_mkdir_payload, ({"cname": "demo"}, 12))
-        self.assertEqual(result["cid"], 3)
+        self.assertEqual(result["cid"], "3")
 
     def test_create_directory_falls_back_to_app_mkdir(self) -> None:
         service = self.make_service()
@@ -418,7 +452,7 @@ class P115ServiceTests(unittest.TestCase):
         result = service.create_directory("demo", parent_id=12)
         self.assertEqual(service.client().fs_mkdir_app_payload[0], {"cname": "demo"})
         self.assertEqual(service.client().fs_mkdir_app_payload[1], 12)
-        self.assertEqual(result["cid"], 3)
+        self.assertEqual(result["cid"], "3")
 
     def test_get_storage_info_returns_normalized_payload(self) -> None:
         service = self.make_service()
@@ -433,7 +467,7 @@ class P115ServiceTests(unittest.TestCase):
 
     def test_batch_copy_entries_with_ids(self) -> None:
         service = self.make_service()
-        result = service.batch_copy_entries(source_ids=[21, 22], destination_dir_path="/docs")
+        result = service.batch_copy_entries(source_ids=["21", "22"], destination_dir_path="/docs")
         self.assertEqual(result["source_ids"], [21, 22])
         self.assertEqual(service.client().copy_payload, ([21, 22], 12))
 
@@ -446,7 +480,7 @@ class P115ServiceTests(unittest.TestCase):
 
     def test_batch_remove_entries_with_ids(self) -> None:
         service = self.make_service()
-        result = service.batch_remove_entries(source_ids=[21, 22])
+        result = service.batch_remove_entries(source_ids=["21", "22"])
         self.assertEqual(result["source_ids"], [21, 22])
         self.assertEqual(service.client().delete_payload, [21, 22])
 
@@ -468,7 +502,7 @@ class P115ServiceTests(unittest.TestCase):
     def test_get_ancestors_returns_chain(self) -> None:
         service = self.make_service()
         result = service.get_ancestors(remote_path="/docs/demo.txt")
-        self.assertEqual(result["ancestors"][0]["id"], 0)
+        self.assertEqual(result["ancestors"][0]["id"], "0")
 
     def test_glob_entries_returns_bounded_results(self) -> None:
         service = self.make_service()
@@ -601,13 +635,13 @@ class P115ServiceTests(unittest.TestCase):
         service = self.make_service()
         result = service.get_recycle_bin_entry(9)
         self.assertEqual(service.client().recyclebin_info_payload, 9)
-        self.assertEqual(result["data"]["rid"], 9)
+        self.assertEqual(result["data"]["rid"], "9")
 
     def test_restore_recycle_bin_entries_returns_ids(self) -> None:
         service = self.make_service()
         result = service.restore_recycle_bin_entries([1, 2])
         self.assertEqual(service.client().recyclebin_revert_payload, [1, 2])
-        self.assertEqual(result["entry_ids"], [1, 2])
+        self.assertEqual(result["entry_ids"], ["1", "2"])
 
     def test_list_labels_returns_payload(self) -> None:
         service = self.make_service()
@@ -617,7 +651,7 @@ class P115ServiceTests(unittest.TestCase):
     def test_set_entry_labels_returns_mapping(self) -> None:
         service = self.make_service()
         result = service.set_entry_labels(remote_id=21, label_ids=[1, 2])
-        self.assertEqual(result["label_ids"], [1, 2])
+        self.assertEqual(result["label_ids"], ["1", "2"])
 
     def test_set_entry_labels_allows_empty_list_for_clear(self) -> None:
         service = self.make_service()
@@ -661,13 +695,13 @@ class P115ServiceTests(unittest.TestCase):
     def test_offline_get_download_paths_returns_payload(self) -> None:
         service = self.make_service()
         result = service.offline_get_download_paths()
-        self.assertEqual(result["data"][0]["file_id"], 12)
+        self.assertEqual(result["data"][0]["file_id"], "12")
 
     def test_offline_set_download_path_resolves_directory(self) -> None:
         service = self.make_service()
         result = service.offline_set_download_path(remote_dir_path="/docs")
         self.assertEqual(service.client().offline_download_path_set_payload, 12)
-        self.assertEqual(result["directory"]["id"], 12)
+        self.assertEqual(result["directory"]["id"], "12")
 
     def test_offline_restart_task_forwards_info_hash(self) -> None:
         service = self.make_service()
@@ -685,7 +719,7 @@ class P115ServiceTests(unittest.TestCase):
         service = self.make_service()
         result = service.clear_recycle_bin(entry_ids=[1, 2], password="123456")
         self.assertEqual(service.client().recyclebin_clean_payload["tid"], "1,2")
-        self.assertEqual(result["entry_ids"], [1, 2])
+        self.assertEqual(result["entry_ids"], ["1", "2"])
 
     def test_get_share_receive_code_returns_payload(self) -> None:
         service = self.make_service()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
+from os import PathLike
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -48,6 +49,31 @@ WEB_LIKE_PLATFORMS = {
     "os_windows",
     "os_mac",
     "os_linux",
+}
+
+ID_KEYS = {
+    "id",
+    "cid",
+    "fid",
+    "pid",
+    "rid",
+    "file_id",
+    "delete_file_id",
+    "user_id",
+    "wp_path_id",
+    "parent_id",
+    "source_id",
+    "destination_dir_id",
+    "remote_id",
+    "directory_id",
+    "remote_dir_id",
+}
+
+ID_LIST_KEYS = {
+    "label_ids",
+    "file_ids",
+    "entry_ids",
+    "source_ids",
 }
 
 
@@ -97,6 +123,7 @@ class P115Service:
         self._fs_cache: dict[str | None, P115FileSystem] = {}
         self._active_platform: str | None = None
         self._qrcode_sessions: dict[str, dict[str, Any]] = {}
+        self._cookie_source_signature: tuple[Any, ...] | None = None
 
     def auth_status(self, validate_remote: bool = False) -> dict[str, Any]:
         status: dict[str, Any] = {
@@ -190,10 +217,8 @@ class P115Service:
             destination.write_text(cookies, encoding="utf-8")
             saved_to = str(destination)
         preferred_platform = session["app"] if session["app"] else self.settings.preferred_platform
-        self._client_instance = None
-        self._fs_instance = None
-        self._client_cache.clear()
-        self._fs_cache.clear()
+        self._reset_client_state()
+        self._cookie_source_signature = None
         self._with_client_fallback(
             "activate_qrcode_cookies",
             lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
@@ -263,7 +288,7 @@ class P115Service:
             scope = self._fs_call("get_attr", target)
             if not scope["is_dir"]:
                 raise ToolError("Search scope must be a directory.")
-            cid = int(scope["id"])
+            cid = self._parse_remote_id(str(scope["id"]), "directory_id")
 
         response = self._client_call(
             "fs_search",
@@ -705,7 +730,7 @@ class P115Service:
         metadata = self._fs_call("get_attr", target)
         if not metadata["is_dir"]:
             raise ToolError("Offline download path must be a directory.")
-        response = self._client_call("offline_download_path_set", int(metadata["id"]))
+        response = self._client_call("offline_download_path_set", self._parse_remote_id(str(metadata["id"]), "remote_dir_id"))
         return {
             "directory": self._normalize(metadata),
             "result": self._normalize(response),
@@ -729,28 +754,32 @@ class P115Service:
         response = self._client_call("recyclebin_list", {"limit": limit, "offset": offset})
         return self._normalize(response)
 
-    def get_recycle_bin_entry(self, rid: int) -> dict[str, Any]:
-        response = self._client_call("recyclebin_info", rid)
+    def get_recycle_bin_entry(self, rid: str | int) -> dict[str, Any]:
+        response = self._client_call("recyclebin_info", self._parse_remote_id(rid, "rid"))
         return self._normalize(response)
 
-    def restore_recycle_bin_entries(self, entry_ids: list[int]) -> dict[str, Any]:
+    def restore_recycle_bin_entries(self, entry_ids: list[str] | list[int]) -> dict[str, Any]:
         if not entry_ids:
             raise ToolError("entry_ids must not be empty.")
-        response = self._client_call("recyclebin_revert", entry_ids)
+        normalized_entry_ids = self._parse_remote_id_list(entry_ids, "entry_ids")
+        response = self._client_call("recyclebin_revert", normalized_entry_ids)
         return {
-            "entry_ids": [int(item) for item in entry_ids],
+            "entry_ids": [str(item) for item in normalized_entry_ids],
             "result": self._normalize(response),
         }
 
-    def clear_recycle_bin(self, entry_ids: list[int] | None = None, password: str = "") -> dict[str, Any]:
+    def clear_recycle_bin(self, entry_ids: list[str] | list[int] | None = None, password: str = "") -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if entry_ids:
-            payload["tid"] = ",".join(str(int(item)) for item in entry_ids)
+            normalized_entry_ids = self._parse_remote_id_list(entry_ids, "entry_ids")
+            payload["tid"] = ",".join(str(item) for item in normalized_entry_ids)
+        else:
+            normalized_entry_ids = []
         if password:
             payload["password"] = password
         response = self._client_call("recyclebin_clean", payload)
         return {
-            "entry_ids": [int(item) for item in entry_ids] if entry_ids else [],
+            "entry_ids": [str(item) for item in normalized_entry_ids],
             "result": self._normalize(response),
         }
 
@@ -777,12 +806,13 @@ class P115Service:
         response = self._client_call("fs_label_list", payload)
         return self._normalize(response)
 
-    def set_entry_labels(self, remote_id: int, label_ids: list[int]) -> dict[str, Any]:
-        normalized_label_ids = [int(item) for item in label_ids]
-        response = self._client_call("fs_label_set", int(remote_id), label=",".join(str(item) for item in normalized_label_ids))
+    def set_entry_labels(self, remote_id: str | int, label_ids: list[str] | list[int]) -> dict[str, Any]:
+        normalized_label_ids = self._parse_remote_id_list(label_ids, "label_ids")
+        normalized_remote_id = self._parse_remote_id(remote_id, "remote_id")
+        response = self._client_call("fs_label_set", normalized_remote_id, label=",".join(str(item) for item in normalized_label_ids))
         return {
-            "remote_id": int(remote_id),
-            "label_ids": normalized_label_ids,
+            "remote_id": str(normalized_remote_id),
+            "label_ids": [str(item) for item in normalized_label_ids],
             "result": self._normalize(response),
         }
 
@@ -812,8 +842,8 @@ class P115Service:
         *,
         share_code: str,
         receive_code: str,
-        file_ids: list[int],
-        remote_dir_id: int | None = None,
+        file_ids: list[str] | list[int],
+        remote_dir_id: str | int | None = None,
         remote_dir_path: str | None = None,
         is_check: bool = False,
     ) -> dict[str, Any]:
@@ -823,10 +853,11 @@ class P115Service:
             raise ToolError("receive_code must not be empty.")
         if not file_ids:
             raise ToolError("file_ids must not be empty.")
+        normalized_file_ids = self._parse_remote_id_list(file_ids, "file_ids")
         payload: dict[str, Any] = {
             "share_code": share_code.strip(),
             "receive_code": receive_code.strip(),
-            "file_id": ",".join(str(int(item)) for item in file_ids),
+            "file_id": ",".join(str(item) for item in normalized_file_ids),
             "is_check": int(is_check),
         }
         if remote_dir_id is not None or remote_dir_path:
@@ -834,17 +865,17 @@ class P115Service:
             metadata = self._fs_call("get_attr", target)
             if not metadata["is_dir"]:
                 raise ToolError("Share receive destination must be a directory.")
-            payload["cid"] = int(metadata["id"])
+            payload["cid"] = self._parse_remote_id(str(metadata["id"]), "remote_dir_id")
         response = self._client_call("share_receive", payload)
         return {
-            "file_ids": [int(item) for item in file_ids],
+            "file_ids": [str(item) for item in normalized_file_ids],
             "result": self._normalize(response),
         }
 
     def get_share_download_url(
         self,
         *,
-        file_id: int,
+        file_id: str | int,
         share_code: str = "",
         receive_code: str = "",
         share_url: str = "",
@@ -855,7 +886,8 @@ class P115Service:
             raise ToolError("Provide share_url or share_code.")
         if share_code.strip() and not receive_code.strip() and not share_url.strip():
             raise ToolError("receive_code is required when share_code is provided without share_url.")
-        payload: dict[str, Any] = {"file_id": int(file_id)}
+        normalized_file_id = self._parse_remote_id(file_id, "file_id")
+        payload: dict[str, Any] = {"file_id": normalized_file_id}
         if share_code.strip():
             payload["share_code"] = share_code.strip()
             payload["receive_code"] = receive_code.strip()
@@ -872,7 +904,7 @@ class P115Service:
         )
         return {
             "url": self._normalize(url),
-            "file_id": int(file_id),
+            "file_id": str(normalized_file_id),
             "mode": "share_url" if share_url.strip() else "share_code",
         }
 
@@ -976,7 +1008,7 @@ class P115Service:
         destination_meta = self._fs_call("get_attr", destination)
         if not destination_meta["is_dir"]:
             raise ToolError("Destination must be a directory.")
-        response = self._client_call("fs_move", source_entry_ids, pid=int(destination_meta["id"]))
+        response = self._client_call("fs_move", source_entry_ids, pid=self._parse_remote_id(str(destination_meta["id"]), "destination_dir_id"))
         return {
             "source_ids": source_entry_ids,
             "destination": self._normalize(destination_meta),
@@ -1017,7 +1049,7 @@ class P115Service:
         destination_meta = self._fs_call("get_attr", destination)
         if not destination_meta["is_dir"]:
             raise ToolError("Destination must be a directory.")
-        response = self._client_call("fs_copy", source_entry_ids, pid=int(destination_meta["id"]))
+        response = self._client_call("fs_copy", source_entry_ids, pid=self._parse_remote_id(str(destination_meta["id"]), "destination_dir_id"))
         return {
             "source_ids": source_entry_ids,
             "destination": self._normalize(destination_meta),
@@ -1135,11 +1167,35 @@ class P115Service:
             raise ToolError("115 authentication is not configured. Set P115_COOKIES or P115_COOKIES_PATH first.")
         return resolved
 
+    def _cookie_source_fingerprint(self, cookies_source: str | PathLike[str] | None) -> tuple[Any, ...]:
+        if cookies_source is None:
+            return ("none",)
+        if isinstance(cookies_source, PathLike):
+            path = Path(cookies_source)
+            return ("path", str(path.resolve()), path.read_text(encoding="utf-8", errors="replace"))
+        return ("inline", str(cookies_source))
+
+    def _reset_client_state(self) -> None:
+        self._client_instance = None
+        self._fs_instance = None
+        self._client_cache.clear()
+        self._fs_cache.clear()
+        self._active_platform = None
+
+    def _ensure_fresh_cookie_source(self, cookies_source: str | Path | None = None) -> str | Path | None:
+        resolved = self._cookies_source(cookies_source)
+        fingerprint = self._cookie_source_fingerprint(resolved)
+        if self._cookie_source_signature != fingerprint:
+            self._reset_client_state()
+            self._cookie_source_signature = fingerprint
+        return resolved
+
     def _get_client_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115Client:
         normalized = self._normalize_platform(platform)
+        resolved_source = self._ensure_fresh_cookie_source(cookies_source)
         if normalized not in self._client_cache:
             self._client_cache[normalized] = P115Client(
-                self._cookies_source(cookies_source),
+                resolved_source,
                 check_for_relogin=self.settings.p115_check_for_relogin,
                 app=normalized,
                 console_qrcode=self.settings.p115_console_qrcode,
@@ -1155,8 +1211,14 @@ class P115Service:
     def _remember_active_platform(self, platform: str | None, client: P115Client | None = None) -> None:
         normalized = self._normalize_platform(platform)
         self._active_platform = normalized
-        self._client_instance = client or self._get_client_for_platform(normalized)
-        self._fs_instance = self._get_fs_for_platform(normalized)
+        active_client = client or self._get_client_for_platform(normalized)
+        self._client_cache[normalized] = active_client
+        self._client_instance = active_client
+        active_fs = self._fs_cache.get(normalized)
+        if active_fs is None:
+            active_fs = P115FileSystem(active_client)
+            self._fs_cache[normalized] = active_fs
+        self._fs_instance = active_fs
 
     def _with_client_fallback(self, operation: str, callback, *, preferred_platform: str | None = None, cookies_source: str | Path | None = None):
         errors: list[str] = []
@@ -1194,11 +1256,11 @@ class P115Service:
             preferred_platform=preferred_platform,
         )
 
-    def _resolve_directory_id(self, *, remote_id: int | None, remote_path: str | None, allow_root_default: bool) -> int:
+    def _resolve_directory_id(self, *, remote_id: str | int | None, remote_path: str | None, allow_root_default: bool) -> int:
         if remote_id is not None and remote_path:
             raise ToolError("Provide either an id or a path, not both.")
         if remote_id is not None:
-            return int(remote_id)
+            return self._parse_remote_id(remote_id, "remote_id")
         if remote_path:
             if remote_path == "/":
                 return 0
@@ -1209,7 +1271,7 @@ class P115Service:
                 else:
                     response = self._call_backend(client.fs_dir_getid_app, remote_path, app=platform or "android")
                 checked = self._call_backend(check_response, response)
-                return int(checked.get("id") or checked.get("cid") or checked["file_id"])
+                return self._parse_remote_id(str(checked.get("id") or checked.get("cid") or checked["file_id"]), "directory_id")
 
             return self._with_client_fallback("resolve_directory_id", attempt)
         if allow_root_default:
@@ -1346,7 +1408,17 @@ class P115Service:
         if isinstance(value, bytes):
             return value.decode("utf-8", errors="replace")
         if isinstance(value, Mapping):
-            return {str(key): P115Service._normalize(item) for key, item in value.items()}
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                normalized_key = str(key)
+                if isinstance(item, int) and (normalized_key in ID_KEYS or normalized_key.endswith("_id")):
+                    normalized[normalized_key] = str(item)
+                    continue
+                if normalized_key in ID_LIST_KEYS and isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
+                    normalized[normalized_key] = [str(part) for part in item]
+                    continue
+                normalized[normalized_key] = P115Service._normalize(item)
+            return normalized
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             return [P115Service._normalize(item) for item in value]
         attrs = getattr(value, "__dict__", None)
@@ -1376,20 +1448,20 @@ class P115Service:
     def _resolve_many_sources(
         self,
         *,
-        source_ids: list[int] | None,
+        source_ids: list[str] | list[int] | None,
         source_paths: list[str] | None,
     ) -> list[int]:
         if source_ids and source_paths:
             raise ToolError("Provide either source_ids or source_paths, not both.")
         if source_ids:
-            return [int(item) for item in source_ids]
+            return self._parse_remote_id_list(source_ids, "source_ids")
         if source_paths:
             resolved_ids: list[int] = []
             for path in source_paths:
                 if not path.strip():
                     raise ToolError("source_paths must not contain empty values.")
                 metadata = self._fs_call("get_attr", path)
-                resolved_ids.append(int(metadata["id"]))
+                resolved_ids.append(self._parse_remote_id(str(metadata["id"]), "source_ids"))
             return resolved_ids
         raise ToolError("Provide at least one source id or source path.")
 
@@ -1405,16 +1477,35 @@ class P115Service:
     @staticmethod
     def _resolve_remote(
         *,
-        remote_id: int | None,
+        remote_id: str | int | None,
         remote_path: str | None,
         allow_root_default: bool,
     ) -> int | str:
         if remote_id is not None and remote_path:
             raise ToolError("Provide either an id or a path, not both.")
         if remote_id is not None:
-            return remote_id
+            return P115Service._parse_remote_id(remote_id, "remote_id")
         if remote_path:
             return remote_path
         if allow_root_default:
             return ""
         raise ToolError("A target id or path is required.")
+
+    @staticmethod
+    def _parse_remote_id(value: str | int, field_name: str) -> int:
+        if isinstance(value, int):
+            if len(str(abs(value))) >= 16:
+                raise ToolError(f"{field_name} is too large to safely pass as a JSON number. Pass it as a string.")
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ToolError(f"{field_name} must not be empty.")
+        if not normalized.isdigit():
+            raise ToolError(f"{field_name} must be a decimal string.")
+        return int(normalized)
+
+    @classmethod
+    def _parse_remote_id_list(cls, values: list[str] | list[int] | None, field_name: str) -> list[int]:
+        if not values:
+            return []
+        return [cls._parse_remote_id(value, field_name) for value in values]

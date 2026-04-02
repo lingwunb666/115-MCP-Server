@@ -54,7 +54,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def list_directory(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -63,7 +63,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def get_metadata(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -73,7 +73,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     @mcp.tool
     def search_entries(
         query: str,
-        directory_id: int | None = None,
+        directory_id: str | None = None,
         directory_path: str | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -90,7 +90,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     @mcp.tool
     def create_directory(
         name: str,
-        parent_id: int | None = None,
+        parent_id: str | None = None,
         parent_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -124,7 +124,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def path_exists(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -133,7 +133,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def count_directory(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -142,7 +142,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def get_ancestors(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -152,7 +152,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     @mcp.tool
     def glob_entries(
         pattern: str,
-        directory_id: int | None = None,
+        directory_id: str | None = None,
         directory_path: str | None = None,
         ignore_case: bool = False,
         limit: int = 100,
@@ -170,7 +170,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def walk_directory(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         max_depth: int = 2,
         topdown: bool = True,
@@ -189,7 +189,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def get_stat(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -199,7 +199,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     @mcp.tool
     def offline_add_urls(
         urls: list[str],
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | None = None,
         duplicate_policy: str = "error",
     ) -> dict:
         """Create one or more offline download tasks from URLs, magnets, FTP, or ed2k links."""
@@ -216,7 +216,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         pick_code: str,
         info_hash: str = "",
         wanted_indexes: list[int] | None = None,
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | None = None,
         save_path: str = "",
     ) -> dict:
         """Create an offline BT task, optionally selecting torrent file indexes."""
@@ -281,7 +281,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def offline_set_download_path(
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | None = None,
         remote_dir_path: str | None = None,
     ) -> dict:
         """Set the default directory used by offline downloads."""
@@ -303,17 +303,17 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         return bound_service.list_recycle_bin(limit=limit, offset=offset)
 
     @mcp.tool
-    def get_recycle_bin_entry(rid: int) -> dict:
+    def get_recycle_bin_entry(rid: str) -> dict:
         """Get a single recycle-bin entry by recycle id."""
         return bound_service.get_recycle_bin_entry(rid=rid)
 
     @mcp.tool
-    def restore_recycle_bin_entries(entry_ids: list[int]) -> dict:
+    def restore_recycle_bin_entries(entry_ids: list[str]) -> dict:
         """Restore entries from the recycle bin."""
         return bound_service.restore_recycle_bin_entries(entry_ids=entry_ids)
 
     @mcp.tool
-    def clear_recycle_bin(entry_ids: list[int] | None = None, password: str = "") -> dict:
+    def clear_recycle_bin(entry_ids: list[str] | None = None, password: str = "") -> dict:
         """Clear the recycle bin or permanently delete specific recycle-bin entries."""
         return bound_service.clear_recycle_bin(entry_ids=entry_ids, password=password)
 
@@ -329,7 +329,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         return bound_service.list_labels(keyword=keyword, limit=limit, offset=offset, sort=sort, order=order)
 
     @mcp.tool
-    def set_entry_labels(remote_id: int, label_ids: list[int]) -> dict:
+    def set_entry_labels(remote_id: str, label_ids: list[str]) -> dict:
         """Replace the labels assigned to an entry."""
         return bound_service.set_entry_labels(remote_id=remote_id, label_ids=label_ids)
 
@@ -352,8 +352,8 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     def receive_share_entries(
         share_code: str,
         receive_code: str,
-        file_ids: list[int],
-        remote_dir_id: int | None = None,
+        file_ids: list[str],
+        remote_dir_id: str | None = None,
         remote_dir_path: str | None = None,
         is_check: bool = False,
     ) -> dict:
@@ -369,7 +369,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def get_share_download_url(
-        file_id: int,
+        file_id: str,
         share_code: str = "",
         receive_code: str = "",
         share_url: str = "",
@@ -399,7 +399,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     @mcp.tool
     def upload_local_file(
         local_path: str,
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | None = None,
         remote_dir_path: str | None = None,
         remote_filename: str = "",
         refresh: bool = False,
@@ -416,7 +416,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     @mcp.tool
     def download_file(
         local_path: str,
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         overwrite: bool = False,
         refresh: bool = False,
@@ -432,9 +432,9 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def move_entry(
-        source_id: int | None = None,
+        source_id: str | None = None,
         source_path: str | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | None = None,
         destination_dir_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -449,9 +449,9 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def batch_move_entries(
-        source_ids: list[int] | None = None,
+        source_ids: list[str] | None = None,
         source_paths: list[str] | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | None = None,
         destination_dir_path: str | None = None,
     ) -> dict:
         """Move multiple files or directories into another directory in one operation."""
@@ -464,9 +464,9 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def copy_entry(
-        source_id: int | None = None,
+        source_id: str | None = None,
         source_path: str | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | None = None,
         destination_dir_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -481,9 +481,9 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def batch_copy_entries(
-        source_ids: list[int] | None = None,
+        source_ids: list[str] | None = None,
         source_paths: list[str] | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | None = None,
         destination_dir_path: str | None = None,
     ) -> dict:
         """Copy multiple files or directories into another directory in one operation."""
@@ -497,7 +497,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     @mcp.tool
     def rename_entry(
         new_name: str,
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -511,7 +511,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def remove_entry(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
@@ -520,7 +520,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def batch_remove_entries(
-        source_ids: list[int] | None = None,
+        source_ids: list[str] | None = None,
         source_paths: list[str] | None = None,
     ) -> dict:
         """Remove multiple files or directories in one operation."""
@@ -528,7 +528,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
     @mcp.tool
     def get_download_url(
-        remote_id: int | None = None,
+        remote_id: str | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict:
