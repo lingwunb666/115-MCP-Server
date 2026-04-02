@@ -113,8 +113,6 @@ P115_COOKIES_PATH=~/115-cookies.txt
 P115_CHECK_FOR_RELOGIN=true
 P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
-P115_COOKIE_PLATFORM=web
-P115_PLATFORM_FALLBACKS=desktop,harmony,apple_tv,android,qandroid,ios,115ios,ipad,115ipad,wechatmini,alipaymini,tv,windows,mac,linux,os_windows,os_mac,os_linux
 ```
 
 也支持直接通过环境变量传入 cookies：
@@ -129,39 +127,21 @@ P115_COOKIES=UID=...; CID=...; SEID=...; KID=...
 - 未配置 cookies 时，默认不会触发扫码登录
 - 若要允许 `p115client` 在需要时尝试扫码登录，请设置 `P115_ALLOW_QRCODE_LOGIN=true`
 
-### Cookie 平台与自动回退
+- ### Cookie 平台自动推断
 
-如果你知道这份 cookie 来自哪个平台，建议显式配置：
-
-```env
-P115_COOKIE_PLATFORM=web
-```
-
-如果不确定平台，或者希望在某个平台接口失败时自动尝试其它接口，可配置：
-
-```env
-P115_PLATFORM_FALLBACKS=desktop,harmony,apple_tv,android,qandroid,ios,115ios,ipad,115ipad,wechatmini,alipaymini,tv,windows,mac,linux,os_windows,os_mac,os_linux
-```
+服务默认依赖 `p115client` 根据 cookie 自动推断首选登录平台。
 
 当前行为：
 
-1. 如果设置了 `P115_COOKIE_PLATFORM`，服务会优先按该平台选择客户端与接口调用顺序。
-2. 如果当前平台失败，会继续按回退顺序尝试其他平台。
-3. 如果没有设置 `P115_COOKIE_PLATFORM`，服务会自动进入多平台尝试模式。
-4. 所有服务层接口都会通过统一的“平台优先、失败回退”调用器执行。
-
-说明：
-
-- `P115_APP` 仍保留兼容，但推荐优先使用 `P115_COOKIE_PLATFORM` 表达 cookie 来源平台。
-- `web/desktop/harmony/windows/mac/linux/os_*` 更偏网页/桌面路径。
-- `android/qandroid/ios/115ios/ipad/115ipad/wechatmini/alipaymini/tv/apple_tv` 更偏 app/移动端路径。
+1. 不需要手动配置 cookie 平台。
+2. 服务会优先使用 `P115Client` 从 cookie 推断出的平台。
+3. 如果某个接口在当前平台下失败，服务只做最小必要的接口级回退，而不会对大量平台进行轮询。
+4. 这样可以减少失败请求数量，降低触发风控的风险。
 
 ### 推荐的环境变量写法
 
 ```env
 P115_COOKIES_PATH=C:\Users\your-name\115-cookies.txt
-P115_COOKIE_PLATFORM=web
-P115_PLATFORM_FALLBACKS=desktop,harmony,apple_tv,android,qandroid,ios,115ios,ipad,115ipad,wechatmini,alipaymini,tv,windows,mac,linux,os_windows,os_mac,os_linux
 P115_CHECK_FOR_RELOGIN=true
 P115_ALLOW_QRCODE_LOGIN=false
 P115_CONSOLE_QRCODE=false
@@ -675,6 +655,26 @@ scripts/
 ```bash
 ./.venv/Scripts/python -m unittest discover -s tests -v
 ```
+
+## 本地打包为 Windows exe
+
+如果你需要在本地构建 Windows 可执行文件：
+
+```powershell
+./.venv/Scripts/python -m pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File .\scripts\build-exe.ps1
+```
+
+构建完成后输出位于：
+
+```text
+dist\115-MCP-Server.exe
+```
+
+说明：
+
+- 这是基于当前虚拟环境依赖打包出的 Windows 可执行文件
+- 配置仍然通过环境变量或 MCP 客户端 `environment` 传入
 
 ## 部署建议
 
