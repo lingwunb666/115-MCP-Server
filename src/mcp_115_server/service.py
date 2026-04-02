@@ -114,6 +114,13 @@ class OfflineDuplicatePolicy(StrEnum):
     SKIP = "skip"
 
 
+TASK_STATUS_NAMES = {
+    9: "failed",
+    11: "completed",
+    12: "in_progress",
+}
+
+
 class P115Service:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or Settings()
@@ -548,6 +555,10 @@ class P115Service:
             "accepted_urls": unique_urls,
             "duplicates": duplicates,
             "duplicate_policy": duplicate_mode.value,
+            "warnings": self._offline_destination_warnings(
+                remote_dir_id=remote_dir_id,
+                task_info_hashes=[hash_ for hash_ in (self._extract_info_hash_from_url(url) for url in unique_urls) if hash_],
+            ),
             "result": self._normalize(
                 self._with_client_fallback(
                     "offline_add_urls",
@@ -597,7 +608,16 @@ class P115Service:
         if save_path.strip():
             payload["save_path"] = save_path.strip()
         response = self._client_call("offline_add_torrent_open", payload)
-        return self._normalize(response)
+        normalized = self._normalize(response)
+        inferred_hashes = [info_hash.strip()] if info_hash.strip() else []
+        if not inferred_hashes and isinstance(normalized, dict):
+            candidate = normalized.get("info_hash") or normalized.get("data", {}).get("info_hash") if isinstance(normalized.get("data"), dict) else None
+            if candidate:
+                inferred_hashes = [str(candidate)]
+        return {
+            "result": normalized,
+            "warnings": self._offline_destination_warnings(remote_dir_id=remote_dir_id, task_info_hashes=inferred_hashes),
+        }
 
     def offline_list_tasks(self, page: int = 1) -> dict[str, Any]:
         if page <= 0:
@@ -647,6 +667,44 @@ class P115Service:
             "page_count": response.get("page_count"),
             "tasks": self._normalize(response.get("tasks", [])),
             "result": self._normalize(response),
+        }
+
+    def offline_find_tasks(
+        self,
+        *,
+        query: str = "",
+        info_hash: str = "",
+        status: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        if limit <= 0:
+            raise ToolError("limit must be positive.")
+        if offset < 0:
+            raise ToolError("offset must be non-negative.")
+        if status:
+            tasks = self._list_all_offline_tasks(status=status)
+        else:
+            tasks = self._list_all_offline_tasks()
+        normalized_query = query.strip().lower()
+        normalized_hash = info_hash.strip().lower()
+        matched: list[dict[str, Any]] = []
+        for task in tasks:
+            if normalized_hash and str(task.get("info_hash", "")).strip().lower() != normalized_hash:
+                continue
+            if normalized_query and normalized_query not in self._offline_task_search_text(task):
+                continue
+            matched.append(task)
+        window = matched[offset : offset + limit]
+        return {
+            "query": query or None,
+            "info_hash": info_hash or None,
+            "status": status or None,
+            "offset": offset,
+            "limit": limit,
+            "count": len(window),
+            "total_matches": len(matched),
+            "tasks": self._normalize(window),
         }
 
     def offline_remove_task(self, info_hash: str, delete_source_file: bool = False) -> dict[str, Any]:
@@ -1323,14 +1381,44 @@ class P115Service:
             except Exception:
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
 
-    def _list_all_offline_tasks(self) -> list[dict[str, Any]]:
-        first_page = self.offline_list_tasks(page=1)
+    def _list_all_offline_tasks(self, status: str = "") -> list[dict[str, Any]]:
+        first_page = self.offline_list_tasks_advanced(page=1, page_size=1150, status=status) if status else self.offline_list_tasks(page=1)
         tasks = list(first_page.get("tasks", []))
         page_count = int(first_page.get("page_count") or 1)
         for page in range(2, page_count + 1):
-            page_result = self.offline_list_tasks(page=page)
+            page_result = self.offline_list_tasks_advanced(page=page, page_size=1150, status=status) if status else self.offline_list_tasks(page=page)
             tasks.extend(page_result.get("tasks", []))
         return tasks
+
+    def _offline_task_search_text(self, task: Mapping[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("name", "file_name", "url", "info_hash", "size_human", "status_name"):
+            value = task.get(key)
+            if value:
+                parts.append(str(value).lower())
+        return "\n".join(parts)
+
+    def _offline_destination_warnings(self, *, remote_dir_id: str | int | None, task_info_hashes: list[str]) -> list[str]:
+        if remote_dir_id is None or not task_info_hashes:
+            return []
+        expected = str(self._parse_remote_id(remote_dir_id, "remote_dir_id"))
+        warnings: list[str] = []
+        for info_hash in task_info_hashes:
+            task = self._find_offline_task_by_info_hash(info_hash)
+            if task is None:
+                warnings.append(f"Could not verify destination for task {info_hash}: task not found in current list yet.")
+                continue
+            actual_dir = None
+            for key in ("wp_path_id", "file_id"):
+                value = task.get(key)
+                if value not in (None, "", 0, "0"):
+                    actual_dir = str(value)
+                    break
+            if actual_dir is None:
+                warnings.append(f"Could not verify destination for task {info_hash}: backend task metadata has no directory field.")
+            elif actual_dir != expected:
+                warnings.append(f"Task {info_hash} appears to target directory {actual_dir}, expected {expected}.")
+        return warnings
 
     def _extract_info_hash_from_url(self, url: str) -> str | None:
         parsed = urlparse(url)

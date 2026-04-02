@@ -546,6 +546,7 @@ class P115ServiceTests(unittest.TestCase):
         self.assertEqual(service.client().offline_urls_legacy_payload["wp_path_id"], 12)
         self.assertEqual(result["accepted_urls"], ["magnet:?xt=urn:btih:test"])
         self.assertEqual(result["urls"][0], "magnet:?xt=urn:btih:test")
+        self.assertIsInstance(result["warnings"], list)
 
     def test_offline_add_urls_falls_back_to_legacy_interface(self) -> None:
         service = self.make_service()
@@ -576,7 +577,8 @@ class P115ServiceTests(unittest.TestCase):
         service = self.make_service()
         result = service.offline_add_torrent(torrent_sha1="sha1", pick_code="pick", wanted_indexes=[0, 2], remote_dir_id=12)
         self.assertEqual(service.client().offline_torrent_payload["wanted"], "0,2")
-        self.assertTrue(result["data"]["created"])
+        self.assertTrue(result["result"]["data"]["created"])
+        self.assertIsInstance(result["warnings"], list)
 
     def test_offline_list_tasks_unwraps_data(self) -> None:
         service = self.make_service()
@@ -589,6 +591,24 @@ class P115ServiceTests(unittest.TestCase):
         result = service.offline_list_tasks_advanced(page=1, page_size=20, status="completed")
         self.assertEqual(service.client().offline_list_legacy_payload["stat"], 11)
         self.assertEqual(result["count"], 2)
+
+    def test_offline_find_tasks_filters_by_query(self) -> None:
+        service = self.make_service()
+        result = service.offline_find_tasks(query="abc", limit=10, offset=0)
+        self.assertEqual(result["total_matches"], 1)
+        self.assertEqual(result["tasks"][0]["info_hash"], "abc")
+
+    def test_offline_find_tasks_filters_by_status(self) -> None:
+        service = self.make_service()
+        result = service.offline_find_tasks(status="completed", limit=10, offset=0)
+        self.assertEqual(result["total_matches"], 2)
+
+    def test_offline_destination_warnings_detect_mismatch(self) -> None:
+        service = self.make_service()
+        service.client().offline_tasks = [{"info_hash": "test", "status": 1, "wp_path_id": "999"}]
+        warnings = service._offline_destination_warnings(remote_dir_id=12, task_info_hashes=["test"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("expected 12", warnings[0])
 
     def test_offline_remove_task_forwards_delete_flag(self) -> None:
         service = self.make_service()
