@@ -14,9 +14,6 @@ class Settings(BaseSettings):
     p115_check_for_relogin: bool = Field(default=True, alias="P115_CHECK_FOR_RELOGIN")
     p115_allow_qrcode_login: bool = Field(default=False, alias="P115_ALLOW_QRCODE_LOGIN")
     p115_console_qrcode: bool = Field(default=False, alias="P115_CONSOLE_QRCODE")
-    p115_app: str | None = Field(default=None, alias="P115_APP")
-    p115_cookie_platform: str | None = Field(default=None, alias="P115_COOKIE_PLATFORM")
-    p115_platform_fallbacks: str | None = Field(default=None, alias="P115_PLATFORM_FALLBACKS")
 
     fastmcp_transport: str = Field(default="stdio", alias="FASTMCP_TRANSPORT")
     fastmcp_host: str = Field(default="127.0.0.1", alias="FASTMCP_HOST")
@@ -43,16 +40,3 @@ class Settings(BaseSettings):
         if self.p115_allow_qrcode_login:
             return "qrcode"
         return "missing"
-
-    @property
-    def preferred_platform(self) -> str | None:
-        for value in (self.p115_cookie_platform, self.p115_app):
-            if value and value.strip():
-                return value.strip()
-        return None
-
-    @property
-    def fallback_platforms(self) -> list[str]:
-        if not self.p115_platform_fallbacks:
-            return []
-        return [part.strip() for part in self.p115_platform_fallbacks.split(",") if part.strip()]

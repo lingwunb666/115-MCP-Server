@@ -343,6 +343,18 @@ class P115ServiceTests(unittest.TestCase):
             self.assertEqual(str(first.cookies), str(cookie_file))
             self.assertEqual(str(second.cookies), str(cookie_file))
 
+    def test_remember_active_platform_uses_client_inferred_login_app(self) -> None:
+        service = P115Service(Settings(P115_COOKIES="UID=dummy; CID=dummy; SEID=dummy; KID=dummy"))
+
+        class DummyCookies:
+            login_app = "web"
+
+        class DummyClient:
+            cookies_str = DummyCookies()
+
+        service._remember_active_platform(None, client=DummyClient())
+        self.assertEqual(service._active_platform, "web")
+
     def test_auth_status_reports_missing_configuration(self) -> None:
         service = P115Service(Settings())
         status = service.auth_status()
@@ -441,7 +453,7 @@ class P115ServiceTests(unittest.TestCase):
         self.assertEqual(service.client().fs_mkdir_payload, ({"cname": "demo"}, 12))
         self.assertEqual(result["cid"], "3")
 
-    def test_create_directory_falls_back_to_app_mkdir(self) -> None:
+    def test_create_directory_stops_on_authorization_error_without_cross_platform_retry(self) -> None:
         service = self.make_service()
         service.client().fail_fs_mkdir_web = False
 
@@ -449,10 +461,8 @@ class P115ServiceTests(unittest.TestCase):
             raise RuntimeError("authorization")
 
         service.client().fs_mkdir = fail_web_mkdir  # type: ignore[method-assign]
-        result = service.create_directory("demo", parent_id=12)
-        self.assertEqual(service.client().fs_mkdir_app_payload[0], {"cname": "demo"})
-        self.assertEqual(service.client().fs_mkdir_app_payload[1], 12)
-        self.assertEqual(result["cid"], "3")
+        with self.assertRaises(ToolError):
+            service.create_directory("demo", parent_id=12)
 
     def test_get_storage_info_returns_normalized_payload(self) -> None:
         service = self.make_service()

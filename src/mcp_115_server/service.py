@@ -129,8 +129,6 @@ class P115Service:
         status: dict[str, Any] = {
             "configured": self.settings.has_auth_configuration,
             "cookies_source": self.settings.cookies_source,
-            "preferred_platform": self.settings.preferred_platform,
-            "fallback_platforms": self.settings.fallback_platforms,
             "active_platform": self._active_platform,
             "check_for_relogin": self.settings.p115_check_for_relogin,
             "allow_qrcode_login": self.settings.p115_allow_qrcode_login,
@@ -216,7 +214,7 @@ class P115Service:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(cookies, encoding="utf-8")
             saved_to = str(destination)
-        preferred_platform = session["app"] if session["app"] else self.settings.preferred_platform
+        preferred_platform = session["app"] if session["app"] else None
         self._reset_client_state()
         self._cookie_source_signature = None
         self._with_client_fallback(
@@ -323,11 +321,11 @@ class P115Service:
         payload = {"cname": name.strip()}
 
         def attempt(client: P115Client, platform: str | None):
-            if self._is_web_like_platform(platform):
+            if self._is_web_like_platform(platform, client):
                 return self._call_backend(check_response, self._call_backend(client.fs_mkdir, payload, pid=parent_directory_id))
             return self._call_backend(
                 check_response,
-                self._call_backend(client.fs_mkdir_app, payload, pid=parent_directory_id, app=platform or "android"),
+                self._call_backend(client.fs_mkdir_app, payload, pid=parent_directory_id, app=self._effective_platform(client, platform) or "android"),
             )
 
         response = self._with_client_fallback("create_directory", attempt)
@@ -1148,16 +1146,25 @@ class P115Service:
         normalized = platform.strip()
         return normalized or None
 
-    def _platform_candidates(self, preferred_platform: str | None = None) -> list[str | None]:
-        ordered: list[str | None] = []
-        for platform in (preferred_platform, self.settings.preferred_platform, *self.settings.fallback_platforms, *DEFAULT_PLATFORM_CANDIDATES):
-            normalized = self._normalize_platform(platform)
-            if normalized not in ordered:
-                ordered.append(normalized)
-        return ordered
+    def _effective_platform(self, client: P115Client, platform: str | None) -> str | None:
+        normalized = self._normalize_platform(platform)
+        if normalized is not None:
+            return normalized
+        cookies_obj = getattr(client, "cookies_str", None)
+        inferred = getattr(cookies_obj, "login_app", None)
+        return self._normalize_platform(inferred)
 
-    def _is_web_like_platform(self, platform: str | None) -> bool:
-        return platform is None or platform in WEB_LIKE_PLATFORMS
+    def _platform_candidates(self, preferred_platform: str | None = None) -> list[str | None]:
+        normalized = self._normalize_platform(preferred_platform)
+        if normalized is None:
+            return [None]
+        return [normalized, None]
+
+    def _is_web_like_platform(self, platform: str | None, client: P115Client | None = None) -> bool:
+        normalized = self._normalize_platform(platform)
+        if normalized is None and client is not None:
+            normalized = self._effective_platform(client, None)
+        return normalized is None or normalized in WEB_LIKE_PLATFORMS
 
     def _cookies_source(self, cookies_source: str | Path | None = None) -> str | Path | None:
         resolved = cookies_source if cookies_source is not None else self.settings.p115_cookies or self.settings.cookies_path
@@ -1209,9 +1216,9 @@ class P115Service:
         return self._fs_cache[normalized]
 
     def _remember_active_platform(self, platform: str | None, client: P115Client | None = None) -> None:
-        normalized = self._normalize_platform(platform)
+        active_client = client or self._get_client_for_platform(platform)
+        normalized = self._effective_platform(active_client, platform)
         self._active_platform = normalized
-        active_client = client or self._get_client_for_platform(normalized)
         self._client_cache[normalized] = active_client
         self._client_instance = active_client
         active_fs = self._fs_cache.get(normalized)
@@ -1266,10 +1273,10 @@ class P115Service:
                 return 0
 
             def attempt(client: P115Client, platform: str | None):
-                if self._is_web_like_platform(platform):
+                if self._is_web_like_platform(platform, client):
                     response = self._call_backend(client.fs_dir_getid, remote_path)
                 else:
-                    response = self._call_backend(client.fs_dir_getid_app, remote_path, app=platform or "android")
+                    response = self._call_backend(client.fs_dir_getid_app, remote_path, app=self._effective_platform(client, platform) or "android")
                 checked = self._call_backend(check_response, response)
                 return self._parse_remote_id(str(checked.get("id") or checked.get("cid") or checked["file_id"]), "directory_id")
 
@@ -1279,7 +1286,7 @@ class P115Service:
         raise ToolError("A target id or path is required.")
 
     def _offline_add_urls_with_platform(self, client: P115Client, platform: str | None, *, open_payload: dict[str, Any], legacy_payload: dict[str, Any]):
-        if self._is_web_like_platform(platform):
+        if self._is_web_like_platform(platform, client):
             try:
                 return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="web"))
             except Exception:
@@ -1293,7 +1300,7 @@ class P115Service:
                 return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="web"))
 
     def _offline_list_tasks_with_platform(self, client: P115Client, platform: str | None, page: int):
-        if self._is_web_like_platform(platform):
+        if self._is_web_like_platform(platform, client):
             return self._call_backend(check_response, self._call_backend(client.offline_list, {"page": page, "page_size": 1150}, type="web"))
         try:
             return self._call_backend(check_response, self._call_backend(client.offline_list_open, page))
@@ -1303,7 +1310,7 @@ class P115Service:
     def _offline_remove_task_with_platform(self, client: P115Client, platform: str | None, info_hash: str, delete_source_file: bool):
         payload_open = {"info_hash": info_hash, "del_source_file": int(delete_source_file)}
         payload_legacy = {"hash[0]": info_hash, "flag": int(delete_source_file)}
-        if self._is_web_like_platform(platform):
+        if self._is_web_like_platform(platform, client):
             try:
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
             except Exception:
@@ -1364,9 +1371,9 @@ class P115Service:
             lambda client, platform: self._call_backend(
                 check_response,
                 self._call_backend(
-                    client.fs_files if self._is_web_like_platform(platform) else client.fs_files_app,
+                    client.fs_files if self._is_web_like_platform(platform, client) else client.fs_files_app,
                     payload,
-                    **({} if self._is_web_like_platform(platform) else {"app": platform or "android"}),
+                    **({} if self._is_web_like_platform(platform, client) else {"app": self._effective_platform(client, platform) or "android"}),
                 ),
             ),
         )
