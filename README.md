@@ -535,6 +535,10 @@ scripts/
 说明：
 
 - `offline_add_urls` 适合 HTTP / HTTPS / FTP / magnet / ed2k
+- `offline_add_urls` **不支持直接提交 `.torrent` 文件**
+- 如果你要添加 BT 种子任务，应使用：
+  - `offline_get_torrent_info`
+  - `offline_add_torrent`
 - `offline_add_urls` 支持 `duplicate_policy`：
   - `error`：如果检测到相同磁链 / 相同 `info_hash` 的云下载任务已存在，立即返回明确错误
   - `skip`：跳过重复任务，只提交新的 URL
