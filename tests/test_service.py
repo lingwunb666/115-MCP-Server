@@ -453,6 +453,14 @@ class P115ServiceTests(unittest.TestCase):
         self.assertEqual(service.client().fs_mkdir_payload, ({"cname": "demo"}, 12))
         self.assertEqual(result["cid"], "3")
 
+    def test_create_directory_prefers_web_mkdir_even_when_active_platform_is_android(self) -> None:
+        service = self.make_service()
+        service._active_platform = "android"
+        result = service.create_directory("demo", parent_id=12)
+        self.assertEqual(service.client().fs_mkdir_payload, ({"cname": "demo"}, 12))
+        self.assertIsNone(service.client().fs_mkdir_app_payload)
+        self.assertEqual(result["cid"], "3")
+
     def test_create_directory_stops_on_authorization_error_without_cross_platform_retry(self) -> None:
         service = self.make_service()
         service.client().fail_fs_mkdir_web = False

@@ -327,15 +327,10 @@ class P115Service:
         parent_directory_id = self._resolve_directory_id(remote_id=parent_id, remote_path=parent_path, allow_root_default=True)
         payload = {"cname": name.strip()}
 
-        def attempt(client: P115Client, platform: str | None):
-            if self._is_web_like_platform(platform, client):
-                return self._call_backend(check_response, self._call_backend(client.fs_mkdir, payload, pid=parent_directory_id))
-            return self._call_backend(
-                check_response,
-                self._call_backend(client.fs_mkdir_app, payload, pid=parent_directory_id, app=self._effective_platform(client, platform) or "android"),
-            )
+        def attempt(client: P115Client, _platform: str | None):
+            return self._call_backend(check_response, self._call_backend(client.fs_mkdir, payload, pid=parent_directory_id))
 
-        response = self._with_client_fallback("create_directory", attempt)
+        response = self._with_client_fallback("create_directory", attempt, preferred_platform="web")
         return self._normalize(response)
 
     def resolve_directory(
