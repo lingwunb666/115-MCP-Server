@@ -47,6 +47,7 @@ class FakeClient:
         self.fail_offline_open: bool = False
         self.fail_fs_mkdir_web: bool = False
         self.offline_tasks = [{"info_hash": "abc", "status": 1}, {"info_hash": "def", "status": 1}]
+        self.offline_pages: list[list[dict]] | None = None
 
     def login_status(self) -> bool:
         return True
@@ -117,10 +118,22 @@ class FakeClient:
 
     def offline_list_open(self, payload: int = 1) -> dict:
         self.offline_list_payload = payload
+        if self.offline_pages is not None:
+            page = max(int(payload), 1)
+            page_count = len(self.offline_pages)
+            page_tasks = list(self.offline_pages[page - 1]) if page <= page_count else []
+            total = sum(len(items) for items in self.offline_pages)
+            return {"state": True, "data": {"count": total, "page_count": page_count, "tasks": page_tasks}}
         return {"state": True, "data": {"count": len(self.offline_tasks), "page_count": 1, "tasks": list(self.offline_tasks)}}
 
     def offline_list(self, payload: dict, type: str = "web") -> dict:
         self.offline_list_legacy_payload = payload
+        if self.offline_pages is not None:
+            page = max(int(payload.get("page", 1)), 1)
+            page_count = len(self.offline_pages)
+            page_tasks = list(self.offline_pages[page - 1]) if page <= page_count else []
+            total = sum(len(items) for items in self.offline_pages)
+            return {"state": True, "count": total, "page_count": page_count, "tasks": page_tasks}
         return {"state": True, "count": len(self.offline_tasks), "page_count": 1, "tasks": list(self.offline_tasks)}
 
     def offline_add_urls(self, payload: dict, method: str = "POST", type: str = "ssp") -> dict:
@@ -550,31 +563,18 @@ class P115ServiceTests(unittest.TestCase):
 
     def test_offline_add_urls_creates_payload(self) -> None:
         service = self.make_service()
-        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="skip")
+        service.settings.p115_debug_logging = True
+        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12)
         self.assertEqual(service.client().offline_urls_legacy_payload["wp_path_id"], 12)
-        self.assertEqual(result["accepted_urls"], ["magnet:?xt=urn:btih:test"])
         self.assertEqual(result["urls"][0], "magnet:?xt=urn:btih:test")
-        self.assertIsInstance(result["warnings"], list)
 
     def test_offline_add_urls_falls_back_to_legacy_interface(self) -> None:
         service = self.make_service()
+        service.settings.p115_debug_logging = True
         service.client().fail_offline_open = True
-        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="skip")
+        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12)
         self.assertEqual(result["result"]["state"], True)
         self.assertEqual(service.client().offline_urls_legacy_payload["wp_path_id"], 12)
-
-    def test_offline_add_urls_skips_duplicate_info_hash_when_requested(self) -> None:
-        service = self.make_service()
-        service.client().offline_list = lambda payload, type="web": {"state": True, "count": 1, "page_count": 1, "tasks": [{"info_hash": "test", "name": "existing"}]}  # type: ignore[method-assign]
-        result = service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="skip")
-        self.assertEqual(result["accepted_urls"], [])
-        self.assertEqual(len(result["duplicates"]), 1)
-
-    def test_offline_add_urls_raises_for_duplicate_when_policy_is_error(self) -> None:
-        service = self.make_service()
-        service.client().offline_list = lambda payload, type="web": {"state": True, "count": 1, "page_count": 1, "tasks": [{"info_hash": "test", "name": "existing"}]}  # type: ignore[method-assign]
-        with self.assertRaises(ToolError):
-            service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12, duplicate_policy="error")
 
     def test_offline_get_torrent_info_returns_data(self) -> None:
         service = self.make_service()
@@ -583,10 +583,10 @@ class P115ServiceTests(unittest.TestCase):
 
     def test_offline_add_torrent_serializes_wanted_indexes(self) -> None:
         service = self.make_service()
+        service.settings.p115_debug_logging = True
         result = service.offline_add_torrent(torrent_sha1="sha1", pick_code="pick", wanted_indexes=[0, 2], remote_dir_id=12)
         self.assertEqual(service.client().offline_torrent_payload["wanted"], "0,2")
-        self.assertTrue(result["result"]["data"]["created"])
-        self.assertIsInstance(result["warnings"], list)
+        self.assertTrue(result["data"]["created"])
 
     def test_offline_list_tasks_unwraps_data(self) -> None:
         service = self.make_service()
@@ -611,12 +611,35 @@ class P115ServiceTests(unittest.TestCase):
         result = service.offline_find_tasks(status="completed", limit=10, offset=0)
         self.assertEqual(result["total_matches"], 2)
 
-    def test_offline_destination_warnings_detect_mismatch(self) -> None:
+    def test_offline_find_tasks_stops_after_collecting_requested_window(self) -> None:
         service = self.make_service()
-        service.client().offline_tasks = [{"info_hash": "test", "status": 1, "wp_path_id": "999"}]
-        warnings = service._offline_destination_warnings(remote_dir_id=12, task_info_hashes=["test"])
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("expected 12", warnings[0])
+        service.client().offline_pages = [
+            [{"info_hash": "match-1", "name": "episode 1"}],
+            [{"info_hash": "match-2", "name": "episode 2"}],
+            [{"info_hash": "match-3", "name": "episode 3"}],
+        ]
+
+        result = service.offline_find_tasks(query="episode", limit=1, offset=0)
+
+        self.assertEqual([task["info_hash"] for task in result["tasks"]], ["match-1"])
+        self.assertFalse(result["scan_complete"])
+        self.assertIsNone(result["total_matches"])
+        self.assertEqual(service.client().offline_list_legacy_payload["page"], 1)
+
+    def test_offline_find_tasks_continues_until_offset_window_is_filled(self) -> None:
+        service = self.make_service()
+        service.client().offline_pages = [
+            [{"info_hash": "match-1", "name": "episode 1"}],
+            [{"info_hash": "match-2", "name": "episode 2"}],
+            [{"info_hash": "match-3", "name": "episode 3"}],
+        ]
+
+        result = service.offline_find_tasks(query="episode", limit=1, offset=1)
+
+        self.assertEqual([task["info_hash"] for task in result["tasks"]], ["match-2"])
+        self.assertFalse(result["scan_complete"])
+        self.assertIsNone(result["total_matches"])
+        self.assertEqual(service.client().offline_list_legacy_payload["page"], 2)
 
     def test_offline_remove_task_forwards_delete_flag(self) -> None:
         service = self.make_service()

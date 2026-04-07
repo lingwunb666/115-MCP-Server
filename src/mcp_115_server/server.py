@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 
 from fastmcp import FastMCP
 from fastmcp.resources import ResourceContent, ResourceResult
@@ -16,6 +17,26 @@ Use remote_id for numeric 115 ids, or remote_path for absolute cloud paths.
 Directory-scoped tools default to the root directory when both id and path are omitted.
 Configure authentication with P115_COOKIES or P115_COOKIES_PATH before calling stateful tools.
 """.strip()
+
+
+def configure_app_logging(settings: Settings) -> None:
+    if not settings.p115_debug_logging:
+        return
+    log_path = settings.debug_log_file_path
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    app_logger = logging.getLogger("mcp_115_server")
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+    target_path = str(log_path.resolve())
+    for handler in app_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and getattr(handler, "baseFilename", None) == target_path:
+            return
+    file_handler = logging.FileHandler(target_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    app_logger.addHandler(file_handler)
 
 
 def create_server(service: P115Service | None = None) -> FastMCP:
@@ -200,10 +221,9 @@ def create_server(service: P115Service | None = None) -> FastMCP:
     def offline_add_urls(
         urls: list[str],
         remote_dir_id: str | None = None,
-        duplicate_policy: str = "error",
     ) -> dict:
         """Create one or more offline download tasks from URLs, magnets, FTP, or ed2k links."""
-        return bound_service.offline_add_urls(urls, remote_dir_id=remote_dir_id, duplicate_policy=duplicate_policy)
+        return bound_service.offline_add_urls(urls, remote_dir_id=remote_dir_id)
 
     @mcp.tool
     def offline_get_torrent_info(torrent_sha1: str, pick_code: str) -> dict:
@@ -545,6 +565,7 @@ def create_server(service: P115Service | None = None) -> FastMCP:
 
 def main() -> None:
     settings = Settings()
+    configure_app_logging(settings)
     parser = argparse.ArgumentParser(description="Run the 115 FastMCP server.")
     parser.add_argument(
         "--transport",

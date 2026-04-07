@@ -505,7 +505,6 @@ scripts/
 已实现的离线下载工具：
 
 - `offline_add_urls(urls=[...], remote_dir_id=123)`
-- `offline_add_urls(urls=[...], remote_dir_id=123, duplicate_policy="error")`
 - `offline_get_torrent_info(torrent_sha1="...", pick_code="...")`
 - `offline_add_torrent(torrent_sha1="...", pick_code="...", wanted_indexes=[0,1])`
 - `offline_list_tasks(page=1)`
@@ -539,10 +538,6 @@ scripts/
 - 如果你要添加 BT 种子任务，应使用：
   - `offline_get_torrent_info`
   - `offline_add_torrent`
-- `offline_add_urls` 支持 `duplicate_policy`：
-  - `error`：如果检测到相同磁链 / 相同 `info_hash` 的云下载任务已存在，立即返回明确错误
-  - `skip`：跳过重复任务，只提交新的 URL
-- 默认推荐使用 `duplicate_policy="error"`，这样可以避免重复磁链导致的卡住或误判
 - `offline_get_torrent_info` 可先查看 BT 内容，再配合 `wanted_indexes` 精选文件
 - `offline_list_tasks` 已经对 Open API 的响应结构做了整形，直接返回 `count / page_count / tasks`
 - `offline_find_tasks` 会在 MCP 层基于分页结果执行本地搜索/过滤，支持：
@@ -561,21 +556,6 @@ scripts/
 - `offline_remove_tasks` 用于按 `info_hash` 批量删除离线任务
 - `offline_get_sign_info` 返回低层离线接口会用到的 `sign/time` 等信息
 - `offline_get_quota_package_array` / `offline_get_quota_package_info` 返回更详细的离线套餐/配额信息
-
-#### 目录落位校验与 warnings
-
-`offline_add_urls` 和 `offline_add_torrent` 现在会返回 `warnings` 字段。
-
-用途：
-
-- 当你传入 `remote_dir_id` 时，MCP 会尽量根据任务元数据检查它是否真的落到了预期目录
-- 如果无法确认，或者任务元数据里显示的目录和预期目录不一致，就会在 `warnings` 中给出提示
-
-重要说明：
-
-- 这是一种**最佳努力校验**，不是后端强保证
-- 115 后端在某些接口分支下，可能不会稳定回传足够的目录信息
-- 因此 `warnings` 能帮助你发现可疑情况，但不能替代最终目录核验
 
 ### 8. 回收站
 

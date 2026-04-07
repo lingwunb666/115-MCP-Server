@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     fastmcp_port: int = Field(default=8000, alias="FASTMCP_PORT")
     fastmcp_path: str = Field(default="/mcp", alias="FASTMCP_PATH")
     fastmcp_log_level: str = Field(default="info", alias="FASTMCP_LOG_LEVEL")
+    p115_debug_logging: bool = Field(default=True, alias="P115_DEBUG_LOGGING")
+    p115_debug_log_file: str | None = Field(default="./logs/115-mcp-debug.log", alias="P115_DEBUG_LOG_FILE")
 
     @property
     def cookies_path(self) -> Path | None:
@@ -40,3 +42,9 @@ class Settings(BaseSettings):
         if self.p115_allow_qrcode_login:
             return "qrcode"
         return "missing"
+
+    @property
+    def debug_log_file_path(self) -> Path | None:
+        if not self.p115_debug_log_file:
+            return None
+        return Path(self.p115_debug_log_file).expanduser()

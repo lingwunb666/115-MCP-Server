@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from enum import StrEnum
 from os import PathLike
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from fastmcp.exceptions import ToolError
@@ -15,6 +16,9 @@ from p115client.fs import P115FileSystem
 from yarl import URL
 
 from .config import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_PLATFORM_CANDIDATES = (
@@ -109,11 +113,6 @@ OFFLINE_TASK_STATUS_TO_FLAG = {
 }
 
 
-class OfflineDuplicatePolicy(StrEnum):
-    ERROR = "error"
-    SKIP = "skip"
-
-
 TASK_STATUS_NAMES = {
     9: "failed",
     11: "completed",
@@ -131,6 +130,16 @@ class P115Service:
         self._active_platform: str | None = None
         self._qrcode_sessions: dict[str, dict[str, Any]] = {}
         self._cookie_source_signature: tuple[Any, ...] | None = None
+
+    def _debug_log(self, event: str, **fields: Any) -> None:
+        if not self.settings.p115_debug_logging:
+            return
+        payload = " ".join(f"{key}={fields[key]!r}" for key in sorted(fields))
+        logger.info("[p115-debug] %s%s", event, f" {payload}" if payload else "")
+
+    @staticmethod
+    def _elapsed_ms(start: float) -> int:
+        return int((time.perf_counter() - start) * 1000)
 
     def auth_status(self, validate_remote: bool = False) -> dict[str, Any]:
         status: dict[str, Any] = {
@@ -511,61 +520,60 @@ class P115Service:
         urls: list[str],
         *,
         remote_dir_id: int | None = None,
-        duplicate_policy: str = OfflineDuplicatePolicy.ERROR.value,
     ) -> dict[str, Any]:
+        request_start = time.perf_counter()
         normalized_urls = [item.strip() for item in urls if item.strip()]
         if not normalized_urls:
             raise ToolError("urls must contain at least one non-empty entry.")
-        try:
-            duplicate_mode = OfflineDuplicatePolicy(duplicate_policy)
-        except ValueError as exc:
-            raise ToolError(f"Invalid duplicate_policy: {duplicate_policy}") from exc
-        existing_tasks = self._list_all_offline_tasks()
-        duplicates: list[dict[str, Any]] = []
-        unique_urls: list[str] = []
+        request_id = str(uuid4())[:8]
+        scheme_counts: dict[str, int] = {}
         for url in normalized_urls:
-            duplicate = self._find_duplicate_offline_task(url, existing_tasks)
-            if duplicate is not None:
-                duplicates.append({"url": url, "task": self._normalize(duplicate)})
-            else:
-                unique_urls.append(url)
-        if duplicates and duplicate_mode is OfflineDuplicatePolicy.ERROR:
-            duplicate_hashes = [str(item["task"].get("info_hash", "")) for item in duplicates]
-            raise ToolError(f"Duplicate offline task detected for info_hash: {', '.join(hash_ for hash_ in duplicate_hashes if hash_)}")
-        if not unique_urls:
-            return {
-                "urls": normalized_urls,
-                "accepted_urls": [],
-                "duplicates": duplicates,
-                "duplicate_policy": duplicate_mode.value,
-                "result": {"state": True, "duplicate": True, "count": len(duplicates)},
-            }
+            scheme = url.split(":", 1)[0].lower() if ":" in url else "unknown"
+            scheme_counts[scheme] = scheme_counts.get(scheme, 0) + 1
+        self._debug_log(
+            "offline_add_urls.start",
+            request_id=request_id,
+            url_count=len(normalized_urls),
+            remote_dir_id=remote_dir_id,
+            schemes=scheme_counts,
+            total_url_chars=sum(len(url) for url in normalized_urls),
+        )
         payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
         if remote_dir_id is not None:
             payload["wp_path_id"] = remote_dir_id
-        open_payload: dict[str, Any] = {"urls": "\n".join(unique_urls)}
-        legacy_payload: dict[str, Any] = {f"url[{index}]": value for index, value in enumerate(unique_urls)}
-        return {
-            "urls": normalized_urls,
-            "accepted_urls": unique_urls,
-            "duplicates": duplicates,
-            "duplicate_policy": duplicate_mode.value,
-            "warnings": self._offline_destination_warnings(
-                remote_dir_id=remote_dir_id,
-                task_info_hashes=[hash_ for hash_ in (self._extract_info_hash_from_url(url) for url in unique_urls) if hash_],
-            ),
-            "result": self._normalize(
+        open_payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
+        legacy_payload: dict[str, Any] = {f"url[{index}]": value for index, value in enumerate(normalized_urls)}
+        try:
+            result = self._normalize(
                 self._with_client_fallback(
                     "offline_add_urls",
                     lambda client, platform: self._offline_add_urls_with_platform(
                         client,
                         platform,
+                        request_id=request_id,
                         open_payload=open_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
                         legacy_payload=legacy_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
                     ),
                 )
-            ),
-        }
+            )
+            self._debug_log(
+                "offline_add_urls.success",
+                request_id=request_id,
+                elapsed_ms=self._elapsed_ms(request_start),
+                url_count=len(normalized_urls),
+            )
+            return {
+                "urls": normalized_urls,
+                "result": result,
+            }
+        except Exception as exc:
+            self._debug_log(
+                "offline_add_urls.failure",
+                request_id=request_id,
+                elapsed_ms=self._elapsed_ms(request_start),
+                error=self._format_backend_error(exc),
+            )
+            raise
 
     def offline_get_torrent_info(self, torrent_sha1: str, pick_code: str) -> dict[str, Any]:
         if not torrent_sha1.strip():
@@ -586,10 +594,22 @@ class P115Service:
         remote_dir_id: int | None = None,
         save_path: str = "",
     ) -> dict[str, Any]:
+        request_start = time.perf_counter()
         if not torrent_sha1.strip():
             raise ToolError("torrent_sha1 must not be empty.")
         if not pick_code.strip():
             raise ToolError("pick_code must not be empty.")
+        request_id = str(uuid4())[:8]
+        self._debug_log(
+            "offline_add_torrent.start",
+            request_id=request_id,
+            has_info_hash=bool(info_hash.strip()),
+            wanted_count=len(wanted_indexes or []),
+            remote_dir_id=remote_dir_id,
+            has_save_path=bool(save_path.strip()),
+            torrent_sha1_len=len(torrent_sha1.strip()),
+            pick_code_len=len(pick_code.strip()),
+        )
         payload: dict[str, Any] = {
             "torrent_sha1": torrent_sha1.strip(),
             "pick_code": pick_code.strip(),
@@ -602,17 +622,23 @@ class P115Service:
             payload["wp_path_id"] = remote_dir_id
         if save_path.strip():
             payload["save_path"] = save_path.strip()
-        response = self._client_call("offline_add_torrent_open", payload)
-        normalized = self._normalize(response)
-        inferred_hashes = [info_hash.strip()] if info_hash.strip() else []
-        if not inferred_hashes and isinstance(normalized, dict):
-            candidate = normalized.get("info_hash") or normalized.get("data", {}).get("info_hash") if isinstance(normalized.get("data"), dict) else None
-            if candidate:
-                inferred_hashes = [str(candidate)]
-        return {
-            "result": normalized,
-            "warnings": self._offline_destination_warnings(remote_dir_id=remote_dir_id, task_info_hashes=inferred_hashes),
-        }
+        try:
+            response = self._client_call("offline_add_torrent_open", payload, request_id=request_id)
+            normalized = self._normalize(response)
+            self._debug_log(
+                "offline_add_torrent.success",
+                request_id=request_id,
+                elapsed_ms=self._elapsed_ms(request_start),
+            )
+            return normalized
+        except Exception as exc:
+            self._debug_log(
+                "offline_add_torrent.failure",
+                request_id=request_id,
+                elapsed_ms=self._elapsed_ms(request_start),
+                error=self._format_backend_error(exc),
+            )
+            raise
 
     def offline_list_tasks(self, page: int = 1) -> dict[str, Any]:
         if page <= 0:
@@ -677,29 +703,41 @@ class P115Service:
             raise ToolError("limit must be positive.")
         if offset < 0:
             raise ToolError("offset must be non-negative.")
-        if status:
-            tasks = self._list_all_offline_tasks(status=status)
-        else:
-            tasks = self._list_all_offline_tasks()
         normalized_query = query.strip().lower()
         normalized_hash = info_hash.strip().lower()
+        required_matches = offset + limit
         matched: list[dict[str, Any]] = []
-        for task in tasks:
-            if normalized_hash and str(task.get("info_hash", "")).strip().lower() != normalized_hash:
-                continue
-            if normalized_query and normalized_query not in self._offline_task_search_text(task):
-                continue
-            matched.append(task)
-        window = matched[offset : offset + limit]
+        total_matches = 0
+        scan_complete = True
+
+        for page_tasks, page_index, page_count in self._iter_offline_task_pages(status=status):
+            if not page_tasks:
+                break
+            for task in page_tasks:
+                if normalized_hash and str(task.get("info_hash", "")).strip().lower() != normalized_hash:
+                    continue
+                if normalized_query and normalized_query not in self._offline_task_search_text(task):
+                    continue
+                total_matches += 1
+                if total_matches > offset and len(matched) < limit:
+                    matched.append(task)
+                if len(matched) >= limit and total_matches >= required_matches:
+                    if page_index < page_count:
+                        scan_complete = False
+                    break
+            if len(matched) >= limit and total_matches >= required_matches:
+                break
+
         return {
             "query": query or None,
             "info_hash": info_hash or None,
             "status": status or None,
             "offset": offset,
             "limit": limit,
-            "count": len(window),
-            "total_matches": len(matched),
-            "tasks": self._normalize(window),
+            "count": len(matched),
+            "total_matches": total_matches if scan_complete else None,
+            "scan_complete": scan_complete,
+            "tasks": self._normalize(matched),
         }
 
     def offline_remove_task(self, info_hash: str, delete_source_file: bool = False) -> dict[str, Any]:
@@ -1280,18 +1318,46 @@ class P115Service:
             self._fs_cache[normalized] = active_fs
         self._fs_instance = active_fs
 
-    def _with_client_fallback(self, operation: str, callback, *, preferred_platform: str | None = None, cookies_source: str | Path | None = None):
+    def _with_client_fallback(self, operation: str, callback, *, preferred_platform: str | None = None, cookies_source: str | Path | None = None, request_id: str | None = None):
         errors: list[str] = []
         for platform in self._platform_candidates(preferred_platform):
+            attempt_start = time.perf_counter()
             client = self._get_client_for_platform(platform, cookies_source=cookies_source)
+            effective_platform = self._effective_platform(client, platform)
+            self._debug_log(
+                "client_fallback.attempt.start",
+                request_id=request_id,
+                operation=operation,
+                platform=platform,
+                effective_platform=effective_platform,
+            )
             try:
                 result = callback(client, platform)
                 self._remember_active_platform(platform, client=client)
+                self._debug_log(
+                    "client_fallback.attempt.success",
+                    request_id=request_id,
+                    operation=operation,
+                    platform=platform,
+                    effective_platform=effective_platform,
+                    elapsed_ms=self._elapsed_ms(attempt_start),
+                )
                 return result
             except Exception as exc:  # noqa: BLE001
                 formatted = self._format_backend_error(exc)
                 errors.append(f"{platform or 'default'}: {formatted}")
-                if not self._should_retry_platform(exc):
+                retryable = self._should_retry_platform(exc)
+                self._debug_log(
+                    "client_fallback.attempt.failure",
+                    request_id=request_id,
+                    operation=operation,
+                    platform=platform,
+                    effective_platform=effective_platform,
+                    elapsed_ms=self._elapsed_ms(attempt_start),
+                    retryable=retryable,
+                    error=formatted,
+                )
+                if not retryable:
                     raise ToolError(formatted) from exc
         raise ToolError(f"{operation} failed across platforms: {' | '.join(errors)}")
 
@@ -1302,12 +1368,26 @@ class P115Service:
             preferred_platform=preferred_platform,
         )
 
-    def _client_call(self, method_name: str, *args, preferred_platform: str | None = None, check: bool = True, **kwargs):
+    def _client_call(self, method_name: str, *args, preferred_platform: str | None = None, check: bool = True, request_id: str | None = None, **kwargs):
         def attempt(client: P115Client, _platform: str | None):
+            call_start = time.perf_counter()
+            self._debug_log(
+                "client_call.start",
+                request_id=request_id,
+                method_name=method_name,
+                check=check,
+            )
             response = self._call_backend(getattr(client, method_name), *args, **kwargs)
-            return self._call_backend(check_response, response) if check else response
+            checked = self._call_backend(check_response, response) if check else response
+            self._debug_log(
+                "client_call.success",
+                request_id=request_id,
+                method_name=method_name,
+                elapsed_ms=self._elapsed_ms(call_start),
+            )
+            return checked
 
-        return self._with_client_fallback(method_name, attempt, preferred_platform=preferred_platform)
+        return self._with_client_fallback(method_name, attempt, preferred_platform=preferred_platform, request_id=request_id)
 
     def _fs_call(self, method_name: str, *args, preferred_platform: str | None = None, **kwargs):
         return self._with_fs_fallback(
@@ -1338,19 +1418,59 @@ class P115Service:
             return 0
         raise ToolError("A target id or path is required.")
 
-    def _offline_add_urls_with_platform(self, client: P115Client, platform: str | None, *, open_payload: dict[str, Any], legacy_payload: dict[str, Any]):
+    def _offline_add_urls_with_platform(self, client: P115Client, platform: str | None, *, request_id: str | None = None, open_payload: dict[str, Any], legacy_payload: dict[str, Any]):
+        def attempt_submit(label: str, func, *args, **kwargs):
+            submit_start = time.perf_counter()
+            self._debug_log(
+                "offline_add_urls.submit.start",
+                request_id=request_id,
+                platform=platform,
+                effective_platform=self._effective_platform(client, platform),
+                method=label,
+                legacy_url_count=sum(1 for key in legacy_payload if key.startswith("url[")),
+                open_url_count=len([line for line in str(open_payload.get("urls", "")).splitlines() if line]),
+                has_remote_dir=("wp_path_id" in open_payload) or ("wp_path_id" in legacy_payload),
+            )
+            try:
+                result = self._call_backend(func, *args, **kwargs)
+                self._debug_log(
+                    "offline_add_urls.submit.success",
+                    request_id=request_id,
+                    platform=platform,
+                    effective_platform=self._effective_platform(client, platform),
+                    method=label,
+                    elapsed_ms=self._elapsed_ms(submit_start),
+                )
+                return result
+            except Exception as exc:  # noqa: BLE001
+                self._debug_log(
+                    "offline_add_urls.submit.failure",
+                    request_id=request_id,
+                    platform=platform,
+                    effective_platform=self._effective_platform(client, platform),
+                    method=label,
+                    elapsed_ms=self._elapsed_ms(submit_start),
+                    error=self._format_backend_error(exc),
+                )
+                raise
+
         if self._is_web_like_platform(platform, client):
             try:
-                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="web"))
+                response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
+                return self._call_backend(check_response, response)
             except Exception:
-                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="ssp"))
+                response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
+                return self._call_backend(check_response, response)
         try:
-            return self._call_backend(check_response, self._call_backend(client.offline_add_urls_open, open_payload))
+            response = attempt_submit("open", client.offline_add_urls_open, open_payload)
+            return self._call_backend(check_response, response)
         except Exception:
             try:
-                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="ssp"))
+                response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
+                return self._call_backend(check_response, response)
             except Exception:
-                return self._call_backend(check_response, self._call_backend(client.offline_add_urls, legacy_payload, type="web"))
+                response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
+                return self._call_backend(check_response, response)
 
     def _offline_list_tasks_with_platform(self, client: P115Client, platform: str | None, page: int):
         if self._is_web_like_platform(platform, client):
@@ -1377,54 +1497,23 @@ class P115Service:
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
 
     def _list_all_offline_tasks(self, status: str = "") -> list[dict[str, Any]]:
-        first_page = self.offline_list_tasks_advanced(page=1, page_size=1150, status=status) if status else self.offline_list_tasks(page=1)
-        tasks = list(first_page.get("tasks", []))
-        page_count = int(first_page.get("page_count") or 1)
-        for page in range(2, page_count + 1):
-            page_result = self.offline_list_tasks_advanced(page=page, page_size=1150, status=status) if status else self.offline_list_tasks(page=page)
-            tasks.extend(page_result.get("tasks", []))
+        tasks: list[dict[str, Any]] = []
+        for page_tasks, _, _ in self._iter_offline_task_pages(status=status):
+            if not page_tasks:
+                break
+            tasks.extend(page_tasks)
         return tasks
 
-    def _offline_task_search_text(self, task: Mapping[str, Any]) -> str:
-        parts: list[str] = []
-        for key in ("name", "file_name", "url", "info_hash", "size_human", "status_name"):
-            value = task.get(key)
-            if value:
-                parts.append(str(value).lower())
-        return "\n".join(parts)
-
-    def _offline_destination_warnings(self, *, remote_dir_id: str | int | None, task_info_hashes: list[str]) -> list[str]:
-        if remote_dir_id is None or not task_info_hashes:
-            return []
-        expected = str(self._parse_remote_id(remote_dir_id, "remote_dir_id"))
-        warnings: list[str] = []
-        for info_hash in task_info_hashes:
-            task = self._find_offline_task_by_info_hash(info_hash)
-            if task is None:
-                warnings.append(f"Could not verify destination for task {info_hash}: task not found in current list yet.")
-                continue
-            actual_dir = None
-            for key in ("wp_path_id", "file_id"):
-                value = task.get(key)
-                if value not in (None, "", 0, "0"):
-                    actual_dir = str(value)
-                    break
-            if actual_dir is None:
-                warnings.append(f"Could not verify destination for task {info_hash}: backend task metadata has no directory field.")
-            elif actual_dir != expected:
-                warnings.append(f"Task {info_hash} appears to target directory {actual_dir}, expected {expected}.")
-        return warnings
-
-    def _extract_info_hash_from_url(self, url: str) -> str | None:
-        parsed = urlparse(url)
-        if parsed.scheme.lower() == "magnet":
-            query = parse_qs(parsed.query)
-            for xt in query.get("xt", []):
-                lower = xt.lower()
-                marker = "urn:btih:"
-                if marker in lower:
-                    return xt[lower.index(marker) + len(marker):].lower()
-        return None
+    def _iter_offline_task_pages(self, status: str = ""):
+        page = 1
+        while True:
+            page_result = self.offline_list_tasks_advanced(page=page, page_size=1150, status=status) if status else self.offline_list_tasks(page=page)
+            page_tasks = list(page_result.get("tasks", []))
+            page_count = int(page_result.get("page_count") or page)
+            yield page_tasks, page, page_count
+            if not page_tasks or page >= page_count:
+                break
+            page += 1
 
     def _find_offline_task_by_info_hash(self, info_hash: str) -> dict[str, Any] | None:
         normalized = info_hash.strip().lower()
@@ -1436,15 +1525,13 @@ class P115Service:
                 return task
         return None
 
-    def _find_duplicate_offline_task(self, url: str, tasks: list[dict[str, Any]]) -> dict[str, Any] | None:
-        info_hash = self._extract_info_hash_from_url(url)
-        if not info_hash:
-            return None
-        for task in tasks:
-            task_hash = str(task.get("info_hash", "")).strip().lower()
-            if task_hash == info_hash:
-                return task
-        return None
+    def _offline_task_search_text(self, task: Mapping[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("name", "file_name", "url", "info_hash", "size_human", "status_name"):
+            value = task.get(key)
+            if value:
+                parts.append(str(value).lower())
+        return "\n".join(parts)
 
     def _list_directory_entries(self, directory_id: int) -> list[dict[str, Any]]:
         payload = {"cid": directory_id, "limit": 7000, "offset": 0, "show_dir": 1}
