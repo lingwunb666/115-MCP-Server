@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
@@ -120,6 +121,9 @@ TASK_STATUS_NAMES = {
 }
 
 
+OFFLINE_TASK_SNAPSHOT_TTL_SECONDS = 5.0
+
+
 class P115Service:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or Settings()
@@ -130,6 +134,11 @@ class P115Service:
         self._active_platform: str | None = None
         self._qrcode_sessions: dict[str, dict[str, Any]] = {}
         self._cookie_source_signature: tuple[Any, ...] | None = None
+        self._offline_lane_lock = threading.RLock()
+        self._offline_snapshot_condition = threading.Condition()
+        self._offline_task_snapshots: dict[str, dict[str, Any]] = {}
+        self._offline_snapshot_inflight: set[str] = set()
+        self._offline_generation = 0
 
     def _debug_log(self, event: str, **fields: Any) -> None:
         if not self.settings.p115_debug_logging:
@@ -140,6 +149,136 @@ class P115Service:
     @staticmethod
     def _elapsed_ms(start: float) -> int:
         return int((time.perf_counter() - start) * 1000)
+
+    def _offline_snapshot_key(self, status: str, page_size: int) -> str:
+        return f"status={status or '*'}|page_size={page_size}"
+
+    def _invalidate_offline_task_snapshots(self, *, reason: str) -> None:
+        with self._offline_snapshot_condition:
+            self._offline_generation += 1
+            self._offline_task_snapshots.clear()
+            self._offline_snapshot_condition.notify_all()
+        self._debug_log("offline_snapshot.invalidate", reason=reason, generation=self._offline_generation)
+
+    def _get_cached_offline_task_snapshot(self, *, status: str, page_size: int, refresh: bool) -> dict[str, Any] | None:
+        key = self._offline_snapshot_key(status, page_size)
+        with self._offline_snapshot_condition:
+            snapshot = self._offline_task_snapshots.get(key)
+            if refresh or snapshot is None:
+                return None
+            age_seconds = time.monotonic() - float(snapshot["created_at"])
+            if age_seconds > OFFLINE_TASK_SNAPSHOT_TTL_SECONDS:
+                self._offline_task_snapshots.pop(key, None)
+                return None
+            return {
+                **snapshot,
+                "tasks": list(snapshot["tasks"]),
+                "age_ms": int(age_seconds * 1000),
+            }
+
+    def _store_offline_task_snapshot(
+        self,
+        *,
+        status: str,
+        page_size: int,
+        tasks: list[dict[str, Any]],
+        page_count: int,
+        generation: int,
+    ) -> dict[str, Any]:
+        key = self._offline_snapshot_key(status, page_size)
+        snapshot = {
+            "status": status,
+            "page_size": page_size,
+            "tasks": list(tasks),
+            "count": len(tasks),
+            "page_count": page_count,
+            "generation": generation,
+            "created_at": time.monotonic(),
+        }
+        with self._offline_snapshot_condition:
+            self._offline_task_snapshots[key] = snapshot
+            self._offline_snapshot_inflight.discard(key)
+            self._offline_snapshot_condition.notify_all()
+        self._debug_log(
+            "offline_snapshot.store",
+            status=status or None,
+            page_size=page_size,
+            count=len(tasks),
+            page_count=page_count,
+            generation=generation,
+        )
+        return {
+            **snapshot,
+            "tasks": list(tasks),
+            "age_ms": 0,
+        }
+
+    def _list_all_offline_tasks_cached(
+        self,
+        *,
+        status: str = "",
+        page_size: int = 1150,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        cached = self._get_cached_offline_task_snapshot(status=status, page_size=page_size, refresh=refresh)
+        if cached is not None:
+            self._debug_log(
+                "offline_snapshot.hit",
+                status=status or None,
+                page_size=page_size,
+                count=cached["count"],
+                age_ms=cached["age_ms"],
+                generation=cached["generation"],
+            )
+            return cached
+
+        key = self._offline_snapshot_key(status, page_size)
+        generation = self._offline_generation
+        with self._offline_snapshot_condition:
+            while key in self._offline_snapshot_inflight:
+                self._offline_snapshot_condition.wait(timeout=0.1)
+                cached = self._get_cached_offline_task_snapshot(status=status, page_size=page_size, refresh=False)
+                if cached is not None:
+                    self._debug_log(
+                        "offline_snapshot.shared",
+                        status=status or None,
+                        page_size=page_size,
+                        count=cached["count"],
+                        age_ms=cached["age_ms"],
+                        generation=cached["generation"],
+                    )
+                    return cached
+            self._offline_snapshot_inflight.add(key)
+
+        request_start = time.perf_counter()
+        try:
+            with self._offline_lane_lock:
+                tasks: list[dict[str, Any]] = []
+                page_count = 0
+                for page_tasks, _page_index, current_page_count in self._iter_offline_task_pages(status=status, page_size=page_size):
+                    if not page_tasks:
+                        break
+                    tasks.extend(page_tasks)
+                    page_count = current_page_count
+            return self._store_offline_task_snapshot(
+                status=status,
+                page_size=page_size,
+                tasks=tasks,
+                page_count=page_count,
+                generation=generation,
+            )
+        except Exception:
+            with self._offline_snapshot_condition:
+                self._offline_snapshot_inflight.discard(key)
+                self._offline_snapshot_condition.notify_all()
+            raise
+        finally:
+            self._debug_log(
+                "offline_snapshot.fetch.finish",
+                status=status or None,
+                page_size=page_size,
+                elapsed_ms=self._elapsed_ms(request_start),
+            )
 
     def auth_status(self, validate_remote: bool = False) -> dict[str, Any]:
         status: dict[str, Any] = {
@@ -544,18 +683,20 @@ class P115Service:
         open_payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
         legacy_payload: dict[str, Any] = {f"url[{index}]": value for index, value in enumerate(normalized_urls)}
         try:
-            result = self._normalize(
-                self._with_client_fallback(
-                    "offline_add_urls",
-                    lambda client, platform: self._offline_add_urls_with_platform(
-                        client,
-                        platform,
-                        request_id=request_id,
-                        open_payload=open_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
-                        legacy_payload=legacy_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
-                    ),
+            with self._offline_lane_lock:
+                result = self._normalize(
+                    self._with_client_fallback(
+                        "offline_add_urls",
+                        lambda client, platform: self._offline_add_urls_with_platform(
+                            client,
+                            platform,
+                            request_id=request_id,
+                            open_payload=open_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
+                            legacy_payload=legacy_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
+                        ),
+                    )
                 )
-            )
+            self._invalidate_offline_task_snapshots(reason="offline_add_urls")
             self._debug_log(
                 "offline_add_urls.success",
                 request_id=request_id,
@@ -623,8 +764,10 @@ class P115Service:
         if save_path.strip():
             payload["save_path"] = save_path.strip()
         try:
-            response = self._client_call("offline_add_torrent_open", payload, request_id=request_id)
+            with self._offline_lane_lock:
+                response = self._client_call("offline_add_torrent_open", payload, request_id=request_id)
             normalized = self._normalize(response)
+            self._invalidate_offline_task_snapshots(reason="offline_add_torrent")
             self._debug_log(
                 "offline_add_torrent.success",
                 request_id=request_id,
@@ -643,11 +786,23 @@ class P115Service:
     def offline_list_tasks(self, page: int = 1) -> dict[str, Any]:
         if page <= 0:
             raise ToolError("page must be positive.")
-        response = self._with_client_fallback(
-            "offline_list_tasks",
-            lambda client, platform: self._offline_list_tasks_with_platform(client, platform, page),
-        )
+        request_start = time.perf_counter()
+        request_id = str(uuid4())[:8]
+        self._debug_log("offline_list_tasks.start", request_id=request_id, page=page)
+        with self._offline_lane_lock:
+            response = self._with_client_fallback(
+                "offline_list_tasks",
+                lambda client, platform: self._offline_list_tasks_with_platform(client, platform, page, request_id=request_id),
+            )
         data = response.get("data", response)
+        self._debug_log(
+            "offline_list_tasks.success",
+            request_id=request_id,
+            page=page,
+            elapsed_ms=self._elapsed_ms(request_start),
+            count=data.get("count"),
+            page_count=data.get("page_count"),
+        )
         return {
             "page": page,
             "count": data.get("count"),
@@ -667,18 +822,33 @@ class P115Service:
             raise ToolError("page must be positive.")
         if page_size <= 0:
             raise ToolError("page_size must be positive.")
+        request_start = time.perf_counter()
+        request_id = str(uuid4())[:8]
+        self._debug_log("offline_list_tasks_advanced.start", request_id=request_id, page=page, page_size=page_size, status=status or None)
         payload: dict[str, Any] = {"page": page, "page_size": page_size}
         if status:
             try:
                 payload["stat"] = OFFLINE_TASK_STATUS_TO_FLAG[OfflineTaskStatus(status)]
             except ValueError as exc:
                 raise ToolError(f"Invalid offline task status: {status}") from exc
-        response = self._with_client_fallback(
-            "offline_list_tasks_advanced",
-            lambda client, platform: self._call_backend(
-                check_response,
-                self._call_backend(client.offline_list, payload, type="web" if self._is_web_like_platform(platform) else "ssp"),
-            ),
+        with self._offline_lane_lock:
+            response = self._with_client_fallback(
+                "offline_list_tasks_advanced",
+                lambda client, platform: self._call_backend(
+                    check_response,
+                    self._call_backend(client.offline_list, payload, type="web" if self._is_web_like_platform(platform) else "ssp"),
+                ),
+                request_id=request_id,
+            )
+        self._debug_log(
+            "offline_list_tasks_advanced.success",
+            request_id=request_id,
+            page=page,
+            page_size=page_size,
+            status=status or None,
+            elapsed_ms=self._elapsed_ms(request_start),
+            count=response.get("count"),
+            page_count=response.get("page_count"),
         )
         return {
             "page": page,
@@ -698,6 +868,7 @@ class P115Service:
         status: str = "",
         limit: int = 50,
         offset: int = 0,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         if limit <= 0:
             raise ToolError("limit must be positive.")
@@ -708,24 +879,20 @@ class P115Service:
         required_matches = offset + limit
         matched: list[dict[str, Any]] = []
         total_matches = 0
+        snapshot = self._list_all_offline_tasks_cached(status=status, refresh=refresh)
         scan_complete = True
 
-        for page_tasks, page_index, page_count in self._iter_offline_task_pages(status=status):
-            if not page_tasks:
-                break
-            for task in page_tasks:
-                if normalized_hash and str(task.get("info_hash", "")).strip().lower() != normalized_hash:
-                    continue
-                if normalized_query and normalized_query not in self._offline_task_search_text(task):
-                    continue
-                total_matches += 1
-                if total_matches > offset and len(matched) < limit:
-                    matched.append(task)
-                if len(matched) >= limit and total_matches >= required_matches:
-                    if page_index < page_count:
-                        scan_complete = False
-                    break
+        for task in snapshot["tasks"]:
+            if normalized_hash and str(task.get("info_hash", "")).strip().lower() != normalized_hash:
+                continue
+            if normalized_query and normalized_query not in self._offline_task_search_text(task):
+                continue
+            total_matches += 1
+            if total_matches > offset and len(matched) < limit:
+                matched.append(task)
             if len(matched) >= limit and total_matches >= required_matches:
+                if total_matches < snapshot["count"]:
+                    scan_complete = False
                 break
 
         return {
@@ -734,9 +901,11 @@ class P115Service:
             "status": status or None,
             "offset": offset,
             "limit": limit,
+            "refresh": refresh,
             "count": len(matched),
             "total_matches": total_matches if scan_complete else None,
             "scan_complete": scan_complete,
+            "snapshot_age_ms": snapshot["age_ms"],
             "tasks": self._normalize(matched),
         }
 
@@ -744,10 +913,12 @@ class P115Service:
         if not info_hash.strip():
             raise ToolError("info_hash must not be empty.")
         normalized_hash = info_hash.strip()
-        response = self._with_client_fallback(
-            "offline_remove_task",
-            lambda client, platform: self._offline_remove_task_with_platform(client, platform, normalized_hash, delete_source_file),
-        )
+        with self._offline_lane_lock:
+            response = self._with_client_fallback(
+                "offline_remove_task",
+                lambda client, platform: self._offline_remove_task_with_platform(client, platform, normalized_hash, delete_source_file),
+            )
+        self._invalidate_offline_task_snapshots(reason="offline_remove_task")
         remaining = self._find_offline_task_by_info_hash(normalized_hash)
         return {
             "info_hash": normalized_hash,
@@ -783,7 +954,9 @@ class P115Service:
             clear_scope = OfflineClearScope(scope)
         except ValueError as exc:
             raise ToolError(f"Invalid scope: {scope}") from exc
-        response = self._client_call("offline_clear_open", OFFLINE_CLEAR_SCOPE_TO_FLAG[clear_scope])
+        with self._offline_lane_lock:
+            response = self._client_call("offline_clear_open", OFFLINE_CLEAR_SCOPE_TO_FLAG[clear_scope])
+        self._invalidate_offline_task_snapshots(reason="offline_clear_tasks")
         return {
             "scope": clear_scope.value,
             "result": self._normalize(response),
@@ -828,7 +1001,9 @@ class P115Service:
     def offline_restart_task(self, info_hash: str) -> dict[str, Any]:
         if not info_hash.strip():
             raise ToolError("info_hash must not be empty.")
-        response = self._client_call("offline_restart", info_hash.strip())
+        with self._offline_lane_lock:
+            response = self._client_call("offline_restart", info_hash.strip())
+        self._invalidate_offline_task_snapshots(reason="offline_restart_task")
         return self._normalize(response)
 
     def offline_get_task_count(self, flag: int = 0) -> dict[str, Any]:
@@ -1472,13 +1647,51 @@ class P115Service:
                 response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
                 return self._call_backend(check_response, response)
 
-    def _offline_list_tasks_with_platform(self, client: P115Client, platform: str | None, page: int):
+    def _offline_list_tasks_with_platform(self, client: P115Client, platform: str | None, page: int, *, request_id: str | None = None):
+        def attempt_fetch(label: str, func, *args, **kwargs):
+            fetch_start = time.perf_counter()
+            self._debug_log(
+                "offline_list_tasks.fetch.start",
+                request_id=request_id,
+                platform=platform,
+                effective_platform=self._effective_platform(client, platform),
+                method=label,
+                page=page,
+            )
+            try:
+                response = self._call_backend(check_response, self._call_backend(func, *args, **kwargs))
+                data = response.get("data", response)
+                self._debug_log(
+                    "offline_list_tasks.fetch.success",
+                    request_id=request_id,
+                    platform=platform,
+                    effective_platform=self._effective_platform(client, platform),
+                    method=label,
+                    page=page,
+                    elapsed_ms=self._elapsed_ms(fetch_start),
+                    count=data.get("count"),
+                    page_count=data.get("page_count"),
+                )
+                return response
+            except Exception as exc:
+                self._debug_log(
+                    "offline_list_tasks.fetch.failure",
+                    request_id=request_id,
+                    platform=platform,
+                    effective_platform=self._effective_platform(client, platform),
+                    method=label,
+                    page=page,
+                    elapsed_ms=self._elapsed_ms(fetch_start),
+                    error=self._format_backend_error(exc),
+                )
+                raise
+
         if self._is_web_like_platform(platform, client):
-            return self._call_backend(check_response, self._call_backend(client.offline_list, {"page": page, "page_size": 1150}, type="web"))
+            return attempt_fetch("legacy:web", client.offline_list, {"page": page, "page_size": 1150}, type="web")
         try:
-            return self._call_backend(check_response, self._call_backend(client.offline_list_open, page))
+            return attempt_fetch("open", client.offline_list_open, page)
         except Exception:
-            return self._call_backend(check_response, self._call_backend(client.offline_list, {"page": page, "page_size": 1150}, type="ssp"))
+            return attempt_fetch("legacy:ssp", client.offline_list, {"page": page, "page_size": 1150}, type="ssp")
 
     def _offline_remove_task_with_platform(self, client: P115Client, platform: str | None, info_hash: str, delete_source_file: bool):
         payload_open = {"info_hash": info_hash, "del_source_file": int(delete_source_file)}
@@ -1497,17 +1710,13 @@ class P115Service:
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
 
     def _list_all_offline_tasks(self, status: str = "") -> list[dict[str, Any]]:
-        tasks: list[dict[str, Any]] = []
-        for page_tasks, _, _ in self._iter_offline_task_pages(status=status):
-            if not page_tasks:
-                break
-            tasks.extend(page_tasks)
-        return tasks
+        snapshot = self._list_all_offline_tasks_cached(status=status)
+        return list(snapshot["tasks"])
 
-    def _iter_offline_task_pages(self, status: str = ""):
+    def _iter_offline_task_pages(self, status: str = "", page_size: int = 1150):
         page = 1
         while True:
-            page_result = self.offline_list_tasks_advanced(page=page, page_size=1150, status=status) if status else self.offline_list_tasks(page=page)
+            page_result = self.offline_list_tasks_advanced(page=page, page_size=page_size, status=status) if status else self.offline_list_tasks(page=page)
             page_tasks = list(page_result.get("tasks", []))
             page_count = int(page_result.get("page_count") or page)
             yield page_tasks, page, page_count

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -108,6 +109,10 @@ class FakeClient:
         self.fail_fs_mkdir_web: bool = False
         self.offline_tasks = [{"info_hash": "abc", "status": 1}, {"info_hash": "def", "status": 1}]
         self.offline_pages: list[list[dict]] | None = None
+        self.offline_list_open_calls = 0
+        self.offline_list_legacy_calls = 0
+        self.offline_list_wait_event: threading.Event | None = None
+        self.offline_list_release_event: threading.Event | None = None
 
     def login_status(self) -> bool:
         return True
@@ -177,7 +182,12 @@ class FakeClient:
         return {"state": True, "data": {"created": True, "payload": payload}}
 
     def offline_list_open(self, payload: int = 1) -> dict:
+        self.offline_list_open_calls += 1
         self.offline_list_payload = payload
+        if self.offline_list_wait_event is not None:
+            self.offline_list_wait_event.set()
+        if self.offline_list_release_event is not None:
+            self.offline_list_release_event.wait(timeout=2)
         if self.offline_pages is not None:
             page = max(int(payload), 1)
             page_count = len(self.offline_pages)
@@ -187,7 +197,12 @@ class FakeClient:
         return {"state": True, "data": {"count": len(self.offline_tasks), "page_count": 1, "tasks": list(self.offline_tasks)}}
 
     def offline_list(self, payload: dict, type: str = "web") -> dict:
+        self.offline_list_legacy_calls += 1
         self.offline_list_legacy_payload = payload
+        if self.offline_list_wait_event is not None:
+            self.offline_list_wait_event.set()
+        if self.offline_list_release_event is not None:
+            self.offline_list_release_event.wait(timeout=2)
         if self.offline_pages is not None:
             page = max(int(payload.get("page", 1)), 1)
             page_count = len(self.offline_pages)
@@ -665,6 +680,7 @@ class P115ServiceTests(unittest.TestCase):
         result = service.offline_find_tasks(query="abc", limit=10, offset=0)
         self.assertEqual(result["total_matches"], 1)
         self.assertEqual(result["tasks"][0]["info_hash"], "abc")
+        self.assertEqual(result["snapshot_age_ms"], 0)
 
     def test_offline_find_tasks_filters_by_status(self) -> None:
         service = self.make_service()
@@ -684,7 +700,7 @@ class P115ServiceTests(unittest.TestCase):
         self.assertEqual([task["info_hash"] for task in result["tasks"]], ["match-1"])
         self.assertFalse(result["scan_complete"])
         self.assertIsNone(result["total_matches"])
-        self.assertEqual(service.client().offline_list_legacy_payload["page"], 1)
+        self.assertEqual(service.client().offline_list_legacy_payload["page"], 3)
 
     def test_offline_find_tasks_continues_until_offset_window_is_filled(self) -> None:
         service = self.make_service()
@@ -699,7 +715,107 @@ class P115ServiceTests(unittest.TestCase):
         self.assertEqual([task["info_hash"] for task in result["tasks"]], ["match-2"])
         self.assertFalse(result["scan_complete"])
         self.assertIsNone(result["total_matches"])
-        self.assertEqual(service.client().offline_list_legacy_payload["page"], 2)
+        self.assertEqual(service.client().offline_list_legacy_payload["page"], 3)
+
+    def test_offline_find_tasks_reuses_shared_snapshot_by_default(self) -> None:
+        service = self.make_service()
+        service.client().offline_pages = [
+            [{"info_hash": "match-1", "name": "episode 1"}],
+            [{"info_hash": "match-2", "name": "episode 2"}],
+        ]
+
+        first = service.offline_find_tasks(query="episode", limit=10, offset=0)
+        second = service.offline_find_tasks(query="match-2", limit=10, offset=0)
+
+        self.assertEqual(first["total_matches"], 2)
+        self.assertEqual(second["total_matches"], 1)
+        self.assertEqual(service.client().offline_list_legacy_calls, 2)
+
+    def test_offline_find_tasks_coalesces_inflight_snapshot_refresh(self) -> None:
+        service = self.make_service()
+        service.client().offline_pages = [[{"info_hash": "match-1", "name": "episode 1"}]]
+        service.client().offline_list_wait_event = threading.Event()
+        service.client().offline_list_release_event = threading.Event()
+        results: list[dict] = []
+
+        def run_query() -> None:
+            results.append(service.offline_find_tasks(query="episode", limit=10, offset=0, refresh=True))
+
+        first = threading.Thread(target=run_query)
+        second = threading.Thread(target=run_query)
+        first.start()
+        self.assertTrue(service.client().offline_list_wait_event.wait(timeout=1))
+        second.start()
+        service.client().offline_list_release_event.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(service.client().offline_list_legacy_calls, 1)
+
+    def test_direct_offline_list_tasks_are_serialized_by_offline_lane(self) -> None:
+        service = self.make_service()
+        service.client().offline_pages = [[{"info_hash": "match-1", "name": "episode 1"}]]
+        service.client().offline_list_wait_event = threading.Event()
+        service.client().offline_list_release_event = threading.Event()
+        finished = threading.Event()
+
+        def run_list() -> None:
+            service.offline_list_tasks(page=1)
+            finished.set()
+
+        worker = threading.Thread(target=run_list)
+        worker.start()
+        self.assertTrue(service.client().offline_list_wait_event.wait(timeout=1))
+
+        result: dict | None = None
+
+        def run_find() -> None:
+            nonlocal result
+            result = service.offline_find_tasks(query="episode", limit=10, offset=0, refresh=True)
+
+        follower = threading.Thread(target=run_find)
+        follower.start()
+        self.assertFalse(finished.is_set())
+        self.assertIsNone(result)
+
+        service.client().offline_list_release_event.set()
+        worker.join(timeout=2)
+        follower.join(timeout=2)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(service.client().offline_list_legacy_calls, 2)
+
+    def test_offline_find_tasks_refresh_bypasses_shared_snapshot(self) -> None:
+        service = self.make_service()
+        service.client().offline_pages = [[{"info_hash": "match-1", "name": "episode 1"}]]
+
+        first = service.offline_find_tasks(query="episode", limit=10, offset=0)
+        second = service.offline_find_tasks(query="episode", limit=10, offset=0, refresh=True)
+
+        self.assertEqual(first["total_matches"], 1)
+        self.assertEqual(second["total_matches"], 1)
+        self.assertEqual(service.client().offline_list_legacy_calls, 2)
+
+    def test_offline_add_urls_invalidates_cached_offline_snapshot(self) -> None:
+        service = self.make_service()
+        service.client().offline_pages = [[{"info_hash": "match-1", "name": "episode 1"}]]
+
+        service.offline_find_tasks(query="episode", limit=10, offset=0)
+        service.offline_add_urls(["magnet:?xt=urn:btih:test"], remote_dir_id=12)
+        service.offline_find_tasks(query="episode", limit=10, offset=0)
+
+        self.assertEqual(service.client().offline_list_legacy_calls, 2)
+
+    def test_offline_remove_task_invalidates_cached_offline_snapshot(self) -> None:
+        service = self.make_service()
+        service.client().offline_pages = [[{"info_hash": "abc", "name": "episode 1"}]]
+
+        service.offline_find_tasks(query="episode", limit=10, offset=0)
+        service.offline_remove_task("abc")
+        service.offline_find_tasks(query="episode", limit=10, offset=0)
+
+        self.assertGreaterEqual(service.client().offline_list_legacy_calls, 2)
 
     def test_offline_remove_task_forwards_delete_flag(self) -> None:
         service = self.make_service()
