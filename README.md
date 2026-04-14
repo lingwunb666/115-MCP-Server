@@ -104,9 +104,9 @@ python -m venv .venv
 2. 通过环境变量 `P115_COOKIES_PATH` 指向 cookies 文件
 3. 通过 MCP 工具执行二维码登录
 
-> 本项目**不再支持**通过项目根目录 `.env` 文件自动加载配置，以避免和客户端自身的 MCP 环境配置混淆。
+> 本项目**不支持**通过项目根目录 `.env` 文件自动加载配置。配置来源只保留两种：运行进程时注入的环境变量，以及 `P115_COOKIES_PATH` 指向的本地 `.txt` cookies 文件。
 
-推荐使用环境变量 + cookies 文件：
+推荐使用环境变量 + `.txt` cookies 文件：
 
 ```env
 P115_COOKIES_PATH=~/115-cookies.txt
@@ -124,6 +124,7 @@ P115_COOKIES=UID=...; CID=...; SEID=...; KID=...
 说明：
 
 - `P115_COOKIES` 优先级高于 `P115_COOKIES_PATH`
+- `P115_COOKIES_PATH` 应指向本机上的 `.txt` cookies 文件，例如 `115-cookies.txt`
 - 未配置 cookies 时，默认不会触发扫码登录
 - 若要允许 `p115client` 在需要时尝试扫码登录，请设置 `P115_ALLOW_QRCODE_LOGIN=true`
 
@@ -153,6 +154,8 @@ FASTMCP_TRANSPORT=stdio
 - MCP 客户端配置中的 `environment`
 - 当前终端 / 系统环境变量
 - 进程启动器（如 OpenCode、Claude Desktop、Cursor 等）的环境注入
+
+不要把配置写到项目根目录 `.env` 中；服务不会读取它。
 
 ## 启动
 
