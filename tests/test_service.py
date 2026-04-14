@@ -13,6 +13,66 @@ from mcp_115_server.config import Settings
 from mcp_115_server.service import DEFAULT_PLATFORM_CANDIDATES, P115Service
 
 
+class SettingsBehaviorTests(unittest.TestCase):
+    def test_settings_reads_values_from_process_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "P115_COOKIES": "UID=1; CID=2; SEID=3; KID=4",
+                "P115_COOKIES_PATH": "C:/tmp/115-cookies.txt",
+                "P115_ALLOW_QRCODE_LOGIN": "true",
+            },
+            clear=True,
+        ):
+            settings = Settings()
+
+        self.assertEqual(settings.p115_cookies, "UID=1; CID=2; SEID=3; KID=4")
+        self.assertEqual(settings.p115_cookies_path, "C:/tmp/115-cookies.txt")
+        self.assertTrue(settings.p115_allow_qrcode_login)
+
+    def test_settings_does_not_autoload_root_dotenv_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text("P115_COOKIES=UID=from-dotenv; CID=2; SEID=3; KID=4\n", encoding="utf-8")
+            original_cwd = Path.cwd()
+
+            try:
+                os.chdir(temp_dir)
+                with patch.dict(os.environ, {}, clear=True):
+                    settings = Settings()
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIsNone(settings.p115_cookies)
+        self.assertEqual(settings.cookies_source, "missing")
+
+    def test_settings_accepts_txt_cookie_path_via_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cookies_path = Path(temp_dir) / "115-cookies.txt"
+            cookies_path.write_text("UID=1; CID=2; SEID=3; KID=4", encoding="utf-8")
+
+            with patch.dict(os.environ, {"P115_COOKIES_PATH": str(cookies_path)}, clear=True):
+                settings = Settings()
+
+            self.assertEqual(settings.cookies_source, "file")
+            self.assertEqual(settings.cookies_path, cookies_path)
+
+    def test_settings_ignore_removed_platform_env_vars(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "P115_COOKIE_PLATFORM": "android",
+                "P115_PLATFORM_FALLBACKS": "ios,web",
+            },
+            clear=True,
+        ):
+            settings = Settings()
+
+        self.assertFalse(hasattr(settings, "p115_cookie_platform"))
+        self.assertFalse(hasattr(settings, "p115_platform_fallbacks"))
+        self.assertEqual(settings.cookies_source, "missing")
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.search_payload: dict | None = None
