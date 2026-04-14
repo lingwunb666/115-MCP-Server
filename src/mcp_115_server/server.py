@@ -260,9 +260,9 @@ def create_server(service: P115Service | None = None) -> FastMCP:
         return bound_service.offline_list_tasks_advanced(page=page, page_size=page_size, status=status)
 
     @mcp.tool
-    def offline_find_tasks(query: str = "", info_hash: str = "", status: str = "", limit: int = 50, offset: int = 0) -> dict:
-        """Search/filter offline tasks client-side by query, info hash, and optional status."""
-        return bound_service.offline_find_tasks(query=query, info_hash=info_hash, status=status, limit=limit, offset=offset)
+    def offline_find_tasks(query: str = "", info_hash: str = "", status: str = "", limit: int = 50, offset: int = 0, refresh: bool = False) -> dict:
+        """Search/filter offline tasks client-side by query, info hash, and optional status. Reuses a short-lived shared snapshot by default."""
+        return bound_service.offline_find_tasks(query=query, info_hash=info_hash, status=status, limit=limit, offset=offset, refresh=refresh)
 
     @mcp.tool
     def offline_remove_task(info_hash: str, delete_source_file: bool = False) -> dict:
