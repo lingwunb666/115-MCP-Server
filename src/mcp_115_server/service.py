@@ -81,6 +81,12 @@ ID_LIST_KEYS = {
     "source_ids",
 }
 
+_PROGRAMMING_ERRORS = (AttributeError, TypeError, NameError, SyntaxError, ImportError)
+
+
+def _is_programming_error(exc: Exception) -> bool:
+    return isinstance(exc, _PROGRAMMING_ERRORS) or isinstance(getattr(exc, "__cause__", None), _PROGRAMMING_ERRORS)
+
 
 class OfflineClearScope(StrEnum):
     COMPLETED = "completed"
@@ -134,6 +140,7 @@ class P115Service:
         self._active_platform: str | None = None
         self._qrcode_sessions: dict[str, dict[str, Any]] = {}
         self._cookie_source_signature: tuple[Any, ...] | None = None
+        self._state_lock = threading.RLock()
         self._offline_lane_lock = threading.RLock()
         self._offline_snapshot_condition = threading.Condition()
         self._offline_task_snapshots: dict[str, dict[str, Any]] = {}
@@ -319,16 +326,17 @@ class P115Service:
         session_id = uuid4().hex
         uid = str(token["uid"])
         qrcode_url = token.get("qrcode") or f"https://115.com/scan/dg-{uid}"
-        self._qrcode_sessions[session_id] = {
-            "app": selected_app,
-            "uid": uid,
-            "token": {
-                "uid": token["uid"],
-                "time": token["time"],
-                "sign": token["sign"],
-            },
-            "qrcode_url": qrcode_url,
-        }
+        with self._state_lock:
+            self._qrcode_sessions[session_id] = {
+                "app": selected_app,
+                "uid": uid,
+                "token": {
+                    "uid": token["uid"],
+                    "time": token["time"],
+                    "sign": token["sign"],
+                },
+                "qrcode_url": qrcode_url,
+            }
         return {
             "session_id": session_id,
             "app": selected_app,
@@ -378,7 +386,8 @@ class P115Service:
             preferred_platform=preferred_platform,
             cookies_source=cookies,
         )
-        self._qrcode_sessions.pop(session_id, None)
+        with self._state_lock:
+            self._qrcode_sessions.pop(session_id, None)
         return {
             "session_id": session_id,
             "app": session["app"],
@@ -391,7 +400,7 @@ class P115Service:
     def list_directory(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -400,16 +409,19 @@ class P115Service:
         if not directory["is_dir"]:
             raise ToolError("Target is not a directory.")
         entries = self._list_directory_entries(int(directory["id"]))
-        return {
+        result: dict[str, Any] = {
             "directory": self._normalize(directory),
             "entries": [self._normalize(entry) for entry in entries],
             "count": len(entries),
         }
+        if len(entries) >= 7000:
+            result["truncated"] = True
+        return result
 
     def get_metadata(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -420,7 +432,7 @@ class P115Service:
         self,
         query: str,
         *,
-        directory_id: int | None = None,
+        directory_id: str | int | None = None,
         directory_path: str | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -466,7 +478,7 @@ class P115Service:
         self,
         name: str,
         *,
-        parent_id: int | None = None,
+        parent_id: str | int | None = None,
         parent_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -510,7 +522,7 @@ class P115Service:
     def path_exists(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -524,7 +536,7 @@ class P115Service:
     def count_directory(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -541,7 +553,7 @@ class P115Service:
     def get_ancestors(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -556,7 +568,7 @@ class P115Service:
         self,
         pattern: str,
         *,
-        directory_id: int | None = None,
+        directory_id: str | int | None = None,
         directory_path: str | None = None,
         ignore_case: bool = False,
         limit: int = 100,
@@ -595,7 +607,7 @@ class P115Service:
     def walk_directory(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         max_depth: int = 2,
         topdown: bool = True,
@@ -644,7 +656,7 @@ class P115Service:
     def get_stat(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -658,7 +670,7 @@ class P115Service:
         self,
         urls: list[str],
         *,
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | int | None = None,
     ) -> dict[str, Any]:
         request_start = time.perf_counter()
         normalized_urls = [item.strip() for item in urls if item.strip()]
@@ -677,9 +689,10 @@ class P115Service:
             schemes=scheme_counts,
             total_url_chars=sum(len(url) for url in normalized_urls),
         )
+        validated_dir_id: int | None = self._parse_remote_id(remote_dir_id, "remote_dir_id") if remote_dir_id is not None else None
         payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
-        if remote_dir_id is not None:
-            payload["wp_path_id"] = remote_dir_id
+        if validated_dir_id is not None:
+            payload["wp_path_id"] = validated_dir_id
         open_payload: dict[str, Any] = {"urls": "\n".join(normalized_urls)}
         legacy_payload: dict[str, Any] = {f"url[{index}]": value for index, value in enumerate(normalized_urls)}
         try:
@@ -691,8 +704,8 @@ class P115Service:
                             client,
                             platform,
                             request_id=request_id,
-                            open_payload=open_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
-                            legacy_payload=legacy_payload | ({"wp_path_id": remote_dir_id} if remote_dir_id is not None else {}),
+                            open_payload=open_payload | ({"wp_path_id": validated_dir_id} if validated_dir_id is not None else {}),
+                            legacy_payload=legacy_payload | ({"wp_path_id": validated_dir_id} if validated_dir_id is not None else {}),
                         ),
                     )
                 )
@@ -732,7 +745,7 @@ class P115Service:
         pick_code: str,
         info_hash: str = "",
         wanted_indexes: list[int] | None = None,
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | int | None = None,
         save_path: str = "",
     ) -> dict[str, Any]:
         request_start = time.perf_counter()
@@ -760,7 +773,7 @@ class P115Service:
         if wanted_indexes:
             payload["wanted"] = ",".join(str(int(index)) for index in wanted_indexes)
         if remote_dir_id is not None:
-            payload["wp_path_id"] = remote_dir_id
+            payload["wp_path_id"] = self._parse_remote_id(remote_dir_id, "remote_dir_id")
         if save_path.strip():
             payload["save_path"] = save_path.strip()
         try:
@@ -985,7 +998,7 @@ class P115Service:
     def offline_set_download_path(
         self,
         *,
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | int | None = None,
         remote_dir_path: str | None = None,
     ) -> dict[str, Any]:
         target = self._resolve_remote(remote_id=remote_dir_id, remote_path=remote_dir_path, allow_root_default=False)
@@ -1186,7 +1199,7 @@ class P115Service:
         self,
         local_path: str,
         *,
-        remote_dir_id: int | None = None,
+        remote_dir_id: str | int | None = None,
         remote_dir_path: str | None = None,
         remote_filename: str = "",
         refresh: bool = False,
@@ -1217,7 +1230,7 @@ class P115Service:
         self,
         local_path: str,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         overwrite: bool = False,
         refresh: bool = False,
@@ -1241,9 +1254,9 @@ class P115Service:
     def move_entry(
         self,
         *,
-        source_id: int | None = None,
+        source_id: str | int | None = None,
         source_path: str | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | int | None = None,
         destination_dir_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -1258,9 +1271,9 @@ class P115Service:
     def batch_move_entries(
         self,
         *,
-        source_ids: list[int] | None = None,
+        source_ids: list[str] | list[int] | None = None,
         source_paths: list[str] | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | int | None = None,
         destination_dir_path: str | None = None,
     ) -> dict[str, Any]:
         source_entry_ids = self._resolve_many_sources(source_ids=source_ids, source_paths=source_paths)
@@ -1282,9 +1295,9 @@ class P115Service:
     def copy_entry(
         self,
         *,
-        source_id: int | None = None,
+        source_id: str | int | None = None,
         source_path: str | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | int | None = None,
         destination_dir_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -1299,9 +1312,9 @@ class P115Service:
     def batch_copy_entries(
         self,
         *,
-        source_ids: list[int] | None = None,
+        source_ids: list[str] | list[int] | None = None,
         source_paths: list[str] | None = None,
-        destination_dir_id: int | None = None,
+        destination_dir_id: str | int | None = None,
         destination_dir_path: str | None = None,
     ) -> dict[str, Any]:
         source_entry_ids = self._resolve_many_sources(source_ids=source_ids, source_paths=source_paths)
@@ -1324,7 +1337,7 @@ class P115Service:
         self,
         new_name: str,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -1336,7 +1349,7 @@ class P115Service:
     def remove_entry(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -1346,7 +1359,7 @@ class P115Service:
     def batch_remove_entries(
         self,
         *,
-        source_ids: list[int] | None = None,
+        source_ids: list[str] | list[int] | None = None,
         source_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         source_entry_ids = self._resolve_many_sources(source_ids=source_ids, source_paths=source_paths)
@@ -1359,7 +1372,7 @@ class P115Service:
     def get_download_url(
         self,
         *,
-        remote_id: int | None = None,
+        remote_id: str | int | None = None,
         remote_path: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
@@ -1386,25 +1399,27 @@ class P115Service:
         }
 
     def client(self) -> P115Client:
-        if self._client_instance is None:
-            cookies_source: str | Path | None = self.settings.p115_cookies or self.settings.cookies_path
-            if self.settings.cookies_path is not None and not self.settings.cookies_path.exists():
-                raise ToolError(f"Configured cookies file does not exist: {self.settings.cookies_path}")
-            if cookies_source is None and not self.settings.p115_allow_qrcode_login:
-                raise ToolError(
-                    "115 authentication is not configured. Set P115_COOKIES or P115_COOKIES_PATH first."
+        with self._state_lock:
+            if self._client_instance is None:
+                cookies_source: str | Path | None = self.settings.p115_cookies or self.settings.cookies_path
+                if self.settings.cookies_path is not None and not self.settings.cookies_path.exists():
+                    raise ToolError(f"Configured cookies file does not exist: {self.settings.cookies_path}")
+                if cookies_source is None and not self.settings.p115_allow_qrcode_login:
+                    raise ToolError(
+                        "115 authentication is not configured. Set P115_COOKIES or P115_COOKIES_PATH first."
+                    )
+                self._with_client_fallback(
+                    "initialize_client",
+                    lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
+                    cookies_source=cookies_source,
                 )
-            self._with_client_fallback(
-                "initialize_client",
-                lambda client, _platform: bool(self._call_backend(client.login_status)) or True,
-                cookies_source=cookies_source,
-            )
-        return self._client_instance
+            return self._client_instance
 
     def fs(self) -> P115FileSystem:
-        if self._fs_instance is None:
-            self._fs_instance = self._get_fs_for_platform(self._active_platform)
-        return self._fs_instance
+        with self._state_lock:
+            if self._fs_instance is None:
+                self._fs_instance = self._get_fs_for_platform(self._active_platform)
+            return self._fs_instance
 
     def _normalize_platform(self, platform: str | None) -> str | None:
         if platform is None:
@@ -1445,53 +1460,62 @@ class P115Service:
             return ("none",)
         if isinstance(cookies_source, PathLike):
             path = Path(cookies_source)
-            return ("path", str(path.resolve()), path.read_text(encoding="utf-8", errors="replace"))
+            try:
+                st = path.stat()
+                return ("path", str(path.resolve()), st.st_mtime, st.st_size)
+            except OSError:
+                return ("path", str(path.resolve()), None, None)
         return ("inline", str(cookies_source))
 
     def _reset_client_state(self) -> None:
-        self._client_instance = None
-        self._fs_instance = None
-        self._client_cache.clear()
-        self._fs_cache.clear()
-        self._active_platform = None
+        with self._state_lock:
+            self._client_instance = None
+            self._fs_instance = None
+            self._client_cache.clear()
+            self._fs_cache.clear()
+            self._active_platform = None
 
     def _ensure_fresh_cookie_source(self, cookies_source: str | Path | None = None) -> str | Path | None:
-        resolved = self._cookies_source(cookies_source)
-        fingerprint = self._cookie_source_fingerprint(resolved)
-        if self._cookie_source_signature != fingerprint:
-            self._reset_client_state()
-            self._cookie_source_signature = fingerprint
-        return resolved
+        with self._state_lock:
+            resolved = self._cookies_source(cookies_source)
+            fingerprint = self._cookie_source_fingerprint(resolved)
+            if self._cookie_source_signature != fingerprint:
+                self._reset_client_state()
+                self._cookie_source_signature = fingerprint
+            return resolved
 
     def _get_client_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115Client:
-        normalized = self._normalize_platform(platform)
-        resolved_source = self._ensure_fresh_cookie_source(cookies_source)
-        if normalized not in self._client_cache:
-            self._client_cache[normalized] = P115Client(
-                resolved_source,
-                check_for_relogin=self.settings.p115_check_for_relogin,
-                app=normalized,
-                console_qrcode=self.settings.p115_console_qrcode,
-            )
-        return self._client_cache[normalized]
+        with self._state_lock:
+            normalized = self._normalize_platform(platform)
+            resolved_source = self._ensure_fresh_cookie_source(cookies_source)
+            if normalized not in self._client_cache:
+                self._client_cache[normalized] = P115Client(
+                    resolved_source,
+                    check_for_relogin=self.settings.p115_check_for_relogin,
+                    app=normalized,
+                    console_qrcode=self.settings.p115_console_qrcode,
+                )
+            return self._client_cache[normalized]
 
     def _get_fs_for_platform(self, platform: str | None, cookies_source: str | Path | None = None) -> P115FileSystem:
-        normalized = self._normalize_platform(platform)
-        if normalized not in self._fs_cache:
-            self._fs_cache[normalized] = P115FileSystem(self._get_client_for_platform(normalized, cookies_source=cookies_source))
-        return self._fs_cache[normalized]
+        with self._state_lock:
+            normalized = self._normalize_platform(platform)
+            if normalized not in self._fs_cache:
+                self._fs_cache[normalized] = P115FileSystem(self._get_client_for_platform(normalized, cookies_source=cookies_source))
+            return self._fs_cache[normalized]
 
     def _remember_active_platform(self, platform: str | None, client: P115Client | None = None) -> None:
-        active_client = client or self._get_client_for_platform(platform)
-        normalized = self._effective_platform(active_client, platform)
-        self._active_platform = normalized
-        self._client_cache[normalized] = active_client
-        self._client_instance = active_client
-        active_fs = self._fs_cache.get(normalized)
-        if active_fs is None:
-            active_fs = P115FileSystem(active_client)
-            self._fs_cache[normalized] = active_fs
-        self._fs_instance = active_fs
+        with self._state_lock:
+            active_client = client or self._get_client_for_platform(platform)
+            normalized = self._effective_platform(active_client, platform)
+            self._active_platform = normalized
+            self._client_cache[normalized] = active_client
+            self._client_instance = active_client
+            active_fs = self._fs_cache.get(normalized)
+            if active_fs is None:
+                active_fs = P115FileSystem(active_client)
+                self._fs_cache[normalized] = active_fs
+            self._fs_instance = active_fs
 
     def _with_client_fallback(self, operation: str, callback, *, preferred_platform: str | None = None, cookies_source: str | Path | None = None, request_id: str | None = None):
         errors: list[str] = []
@@ -1633,17 +1657,23 @@ class P115Service:
             try:
                 response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
                 return self._call_backend(check_response, response)
-            except Exception:
+            except Exception as exc:
+                if _is_programming_error(exc):
+                    raise
                 response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
                 return self._call_backend(check_response, response)
         try:
             response = attempt_submit("open", client.offline_add_urls_open, open_payload)
             return self._call_backend(check_response, response)
-        except Exception:
+        except Exception as exc:
+            if _is_programming_error(exc):
+                raise
             try:
                 response = attempt_submit("legacy:ssp", client.offline_add_urls, legacy_payload, type="ssp")
                 return self._call_backend(check_response, response)
-            except Exception:
+            except Exception as exc:
+                if _is_programming_error(exc):
+                    raise
                 response = attempt_submit("legacy:web", client.offline_add_urls, legacy_payload, type="web")
                 return self._call_backend(check_response, response)
 
@@ -1690,7 +1720,9 @@ class P115Service:
             return attempt_fetch("legacy:web", client.offline_list, {"page": page, "page_size": 1150}, type="web")
         try:
             return attempt_fetch("open", client.offline_list_open, page)
-        except Exception:
+        except Exception as exc:
+            if _is_programming_error(exc):
+                raise
             return attempt_fetch("legacy:ssp", client.offline_list, {"page": page, "page_size": 1150}, type="ssp")
 
     def _offline_remove_task_with_platform(self, client: P115Client, platform: str | None, info_hash: str, delete_source_file: bool):
@@ -1699,14 +1731,20 @@ class P115Service:
         if self._is_web_like_platform(platform, client):
             try:
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
-            except Exception:
+            except Exception as exc:
+                if _is_programming_error(exc):
+                    raise
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
         try:
             return self._call_backend(check_response, self._call_backend(client.offline_remove_open, payload_open))
-        except Exception:
+        except Exception as exc:
+            if _is_programming_error(exc):
+                raise
             try:
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="ssp"))
-            except Exception:
+            except Exception as exc:
+                if _is_programming_error(exc):
+                    raise
                 return self._call_backend(check_response, self._call_backend(client.offline_remove, payload_legacy, type="web"))
 
     def _list_all_offline_tasks(self, status: str = "") -> list[dict[str, Any]]:
@@ -1758,7 +1796,19 @@ class P115Service:
         )
         data = response.get("data", [])
         if isinstance(data, list):
+            if len(data) >= 7000:
+                self._debug_log(
+                    "list_directory_entries.truncated",
+                    directory_id=directory_id,
+                    returned=len(data),
+                    limit=7000,
+                )
             return data
+        self._debug_log(
+            "list_directory_entries.unexpected_data_type",
+            directory_id=directory_id,
+            data_type=type(data).__name__,
+        )
         return []
 
     @classmethod
@@ -1777,7 +1827,10 @@ class P115Service:
             "forbidden",
             "401",
             "403",
-            "99",
+            '"errno": 99',
+            '"errno":99',
+            '"errcode": 99',
+            '"errcode":99',
         )
         return any(marker in message for marker in retry_markers)
 
@@ -1809,10 +1862,7 @@ class P115Service:
             return [P115Service._normalize(item) for item in value]
         attrs = getattr(value, "__dict__", None)
         if isinstance(attrs, dict) and attrs:
-            normalized = {str(key): P115Service._normalize(item) for key, item in attrs.items()}
-            if isinstance(value, str):
-                normalized.setdefault("value", str(value))
-            return normalized
+            return {str(key): P115Service._normalize(item) for key, item in attrs.items()}
         return repr(value)
 
     @staticmethod
@@ -1855,10 +1905,11 @@ class P115Service:
         normalized_id = session_id.strip()
         if not normalized_id:
             raise ToolError("session_id must not be empty.")
-        try:
-            return self._qrcode_sessions[normalized_id]
-        except KeyError as exc:
-            raise ToolError(f"Unknown qrcode login session: {normalized_id}") from exc
+        with self._state_lock:
+            try:
+                return self._qrcode_sessions[normalized_id]
+            except KeyError as exc:
+                raise ToolError(f"Unknown qrcode login session: {normalized_id}") from exc
 
     @staticmethod
     def _resolve_remote(

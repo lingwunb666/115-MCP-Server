@@ -364,6 +364,7 @@ scripts/
 - `offline_get_torrent_info`
 - `offline_add_torrent`
 - `offline_list_tasks`
+- `offline_find_tasks`
 - `offline_remove_task`
 - `offline_clear_tasks`
 - `offline_get_quota_info`
